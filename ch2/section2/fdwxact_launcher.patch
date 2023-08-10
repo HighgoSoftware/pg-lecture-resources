@@ -1,0 +1,351 @@
+diff --git a/src/backend/access/Makefile b/src/backend/access/Makefile
+index 0880e0a8bb..49480dd039 100644
+--- a/src/backend/access/Makefile
++++ b/src/backend/access/Makefile
+@@ -9,6 +9,6 @@ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+ SUBDIRS	    = brin common gin gist hash heap index nbtree rmgrdesc spgist \
+-			  table tablesample transam
++			  table tablesample transam fdwxact
+ 
+ include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/fdwxact/Makefile b/src/backend/access/fdwxact/Makefile
+new file mode 100644
+index 0000000000..75df4ed5f0
+--- /dev/null
++++ b/src/backend/access/fdwxact/Makefile
+@@ -0,0 +1,17 @@
++#-------------------------------------------------------------------------
++#
++# Makefile--
++#    Makefile for access/fdwxact
++#
++# IDENTIFICATION
++#    src/backend/access/fdwxact/Makefile
++#
++#-------------------------------------------------------------------------
++
++subdir = src/backend/access/fdwxact
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++
++OBJS = launcher.o
++
++include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/fdwxact/launcher.c b/src/backend/access/fdwxact/launcher.c
+new file mode 100644
+index 0000000000..8fee4b4358
+--- /dev/null
++++ b/src/backend/access/fdwxact/launcher.c
+@@ -0,0 +1,170 @@
++/*-------------------------------------------------------------------------
++ *
++ * launcher.c
++ *
++ * The foreign transaction resolver launcher process starts foreign
++ * transaction resolver processes. The launcher schedules resolver
++ * process to be started when arrived a requested by backend process.
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/backend/access/fdwxact/launcher.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "funcapi.h"
++#include "pgstat.h"
++
++#include "access/fdwxact_launcher.h"
++#include "access/twophase.h"
++#include "commands/dbcommands.h"
++#include "nodes/pg_list.h"
++#include "postmaster/bgworker.h"
++#include "storage/ipc.h"
++#include "storage/proc.h"
++#include "tcop/tcopprot.h"
++#include "utils/builtins.h"
++
++
++int	fdw_xact_check_interval = 60; //60sec
++
++/* max sleep time between cycles (3min) */
++#define DEFAULT_NAPTIME_PER_CYCLE 180000L
++
++static void fdwxact_launcher_sighup(SIGNAL_ARGS);
++static void fdwxact_launcher_onexit(int code, Datum arg);
++
++
++static volatile sig_atomic_t got_SIGHUP = false;
++static volatile sig_atomic_t got_SIGUSR2 = false;
++
++
++/*
++ * Cleanup function for fdwxact launcher
++ *
++ * Called on fdwxact launcher exit.
++ */
++static void
++fdwxact_launcher_onexit(int code, Datum arg)
++{
++//	FdwXactRslvCtl->launcher_pid = InvalidPid;
++}
++
++/* SIGHUP: set flag to reload configuration at next convenient time */
++static void
++fdwxact_launcher_sighup(SIGNAL_ARGS)
++{
++	int			save_errno = errno;
++
++	got_SIGHUP = true;
++
++	SetLatch(MyLatch);
++
++	errno = save_errno;
++}
++
++/* SIGUSR2: set flag to launch new resolver process immediately */
++static void
++fdwxact_launcher_sigusr2(SIGNAL_ARGS)
++{
++	int			save_errno = errno;
++
++	got_SIGUSR2 = true;
++	SetLatch(MyLatch);
++
++	errno = save_errno;
++}
++
++/*
++ * Main loop for the fdwxact launcher process.
++ */
++void
++FdwXactLauncherMain(Datum main_arg)
++{
++	TimestampTz last_start_time = 0;
++
++	ereport(DEBUG2,
++			(errmsg("fdwxact resolver started")));
++
++	before_shmem_exit(fdwxact_launcher_onexit, (Datum) 0);
++
++	pqsignal(SIGHUP, fdwxact_launcher_sighup);
++	pqsignal(SIGUSR2, fdwxact_launcher_sigusr2);
++	pqsignal(SIGTERM, die);
++	BackgroundWorkerUnblockSignals();
++	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
++
++	/* Enter main loop */
++	for (;;)
++	{
++		int			rc;
++		TimestampTz now = 0;
++		long		wait_time = DEFAULT_NAPTIME_PER_CYCLE;
++
++
++		CHECK_FOR_INTERRUPTS();
++		ResetLatch(MyLatch);
++
++		now = GetCurrentTimestamp();
++		if (TimestampDifferenceExceeds(last_start_time, now, (fdw_xact_check_interval * 1000)))
++		{
++			last_start_time = now;
++			elog(WARNING, "checking orphaned prepared transaction");
++			TimeToCheckFdwXactOnGTM();
++		}
++
++		wait_time = (fdw_xact_check_interval * 1000);
++
++		/* Wait for fdw_xact_check_interval timeout */
++		rc = WaitLatch(MyLatch,
++					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
++					   wait_time,
++					   WAIT_EVENT_FDWXACT_LAUNCHER_MAIN);
++
++		if (rc & WL_POSTMASTER_DEATH)
++			proc_exit(1);
++
++		if (rc & WL_LATCH_SET)
++		{
++			ResetLatch(MyLatch);
++			CHECK_FOR_INTERRUPTS();
++		}
++
++		if (got_SIGHUP)
++		{
++			got_SIGHUP = false;
++			ProcessConfigFile(PGC_SIGHUP);
++		}
++	}
++
++	/* Not reachable */
++}
++
++
++/* Register a background worker running the foreign transaction launcher */
++void
++FdwXactLauncherRegister(void)
++{
++	BackgroundWorker bgw;
++	memset(&bgw, 0, sizeof(bgw));
++	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
++		BGWORKER_BACKEND_DATABASE_CONNECTION;
++	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
++	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
++	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "FdwXactLauncherMain");
++	snprintf(bgw.bgw_name, BGW_MAXLEN,
++			 "foreign transaction resolver");
++	snprintf(bgw.bgw_type, BGW_MAXLEN,
++			 "foreign transaction resolver");
++	bgw.bgw_restart_time = 5;
++	bgw.bgw_notify_pid = 0;
++	bgw.bgw_main_arg = (Datum) 0;
++
++	RegisterBackgroundWorker(&bgw);
++}
++
++
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 068e59bec0..23cf863420 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -2625,3 +2625,38 @@ LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
+ 	LWLockRelease(TwoPhaseStateLock);
+ 	return found;
+ }
++
++int
++TimeToCheckFdwXactOnGTM(void)
++{
++	int			i;
++	int			num = 0;
++	int			overage_found = 0;
++	TimestampTz	current_time = GetCurrentTimestamp();
++
++	/* Get shared lock to count orphaned transactions */
++	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
++
++	if (TwoPhaseState->numPrepXacts == 0)
++	{
++		LWLockRelease(TwoPhaseStateLock);
++		return overage_found;
++	}
++
++	num = TwoPhaseState->numPrepXacts;
++	for (i = 0; i < num; i++)
++	{
++		if (TwoPhaseState->prepXacts[i]->prepared_at != 0 &&
++				(strncmp("_fx_", TwoPhaseState->prepXacts[i]->gid, 4) == 0) &&
++				TimestampDifferenceExceeds(TwoPhaseState->prepXacts[i]->prepared_at,
++				current_time, (300 * 1000)))
++		{
++			overage_found = 1;
++			ereport(WARNING,(errmsg("found orphaned prepared transaction \"%s\" at %ld.",
++					TwoPhaseState->prepXacts[i]->gid, TwoPhaseState->prepXacts[i]->prepared_at)));
++		}
++	}
++
++	LWLockRelease(TwoPhaseStateLock);
++	return overage_found;
++}
+diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
+index 0dd22b2351..bb0aae3595 100644
+--- a/src/backend/postmaster/bgworker.c
++++ b/src/backend/postmaster/bgworker.c
+@@ -12,6 +12,7 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/fdwxact_launcher.h"
+ #include "access/parallel.h"
+ #include "libpq/pqsignal.h"
+ #include "miscadmin.h"
+@@ -131,6 +132,9 @@ static const struct
+ 	},
+ 	{
+ 		"ParallelApplyWorkerMain", ParallelApplyWorkerMain
++	},
++	{
++		"FdwXactLauncherMain", FdwXactLauncherMain
+ 	}
+ };
+ 
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 4c49393fc5..092d041b46 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -89,6 +89,7 @@
+ #include <pthread.h>
+ #endif
+ 
++#include "access/fdwxact_launcher.h"
+ #include "access/transam.h"
+ #include "access/xlog.h"
+ #include "access/xlogrecovery.h"
+@@ -1002,6 +1003,11 @@ PostmasterMain(int argc, char *argv[])
+ 	 */
+ 	ApplyLauncherRegister();
+ 
++	/*
++	* Register the orphaned prepared transaction checker
++	*/
++	FdwXactLauncherRegister();
++
+ 	/*
+ 	 * process any libraries that should be preloaded at postmaster start
+ 	 */
+diff --git a/src/include/access/fdwxact_launcher.h b/src/include/access/fdwxact_launcher.h
+new file mode 100644
+index 0000000000..a30cbda591
+--- /dev/null
++++ b/src/include/access/fdwxact_launcher.h
+@@ -0,0 +1,21 @@
++/*-------------------------------------------------------------------------
++ *
++ * fdwxact_launcher.h
++ *	  PostgreSQL foreign transaction launcher definitions
++ *
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * src/include/access/fdwxact_launcher.h
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FDWXACT_LAUNCHER_H
++#define FDWXACT_LAUNCHER_H
++
++extern void FdwXactLauncherRegister(void);
++extern void FdwXactLauncherMain(Datum main_arg);
++
++
++#endif							/* FDWXACT_LAUNCHER_H */
+diff --git a/src/include/access/twophase.h b/src/include/access/twophase.h
+index 21e2af7387..7400357b23 100644
+--- a/src/include/access/twophase.h
++++ b/src/include/access/twophase.h
+@@ -62,4 +62,5 @@ extern void PrepareRedoRemove(TransactionId xid, bool giveWarning);
+ extern void restoreTwoPhaseData(void);
+ extern bool LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
+ 						TimestampTz origin_prepare_timestamp);
++extern int TimeToCheckFdwXactOnGTM(void);
+ #endif							/* TWOPHASE_H */
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index 518d3b0a1f..3e6d6c1505 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -47,7 +47,8 @@ typedef enum
+ 	WAIT_EVENT_SYSLOGGER_MAIN,
+ 	WAIT_EVENT_WAL_RECEIVER_MAIN,
+ 	WAIT_EVENT_WAL_SENDER_MAIN,
+-	WAIT_EVENT_WAL_WRITER_MAIN
++	WAIT_EVENT_WAL_WRITER_MAIN,
++	WAIT_EVENT_FDWXACT_LAUNCHER_MAIN
+ } WaitEventActivity;
+ 
+ /* ----------

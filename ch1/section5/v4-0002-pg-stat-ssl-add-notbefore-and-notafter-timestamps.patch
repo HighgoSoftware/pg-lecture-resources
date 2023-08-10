@@ -1,0 +1,347 @@
+diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
+index 5cfdc70c03..a13cec0e98 100644
+--- a/doc/src/sgml/monitoring.sgml
++++ b/doc/src/sgml/monitoring.sgml
+@@ -3506,6 +3506,26 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
+        This field is truncated like <structfield>client_dn</structfield>.
+       </para></entry>
+      </row>
++
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>not_befoer</structfield> <type>text</type>
++      </para>
++      <para>
++       Not before timestamp of the client certificate expressed in ISO 8601
++       format of YYYY-MM-DDThh:mm:ssZ
++      </para></entry>
++     </row>
++
++     <row>
++      <entry role="catalog_table_entry"><para role="column_definition">
++       <structfield>not_after</structfield> <type>text</type>
++      </para>
++      <para>
++       Not after timestamp of the client certificate expressed in ISO 8601
++       format of YYYY-MM-DDThh:mm:ssZ
++      </para></entry>
++     </row>
+     </tbody>
+    </tgroup>
+   </table>
+diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
+index c18fea8362..104420c2df 100644
+--- a/src/backend/catalog/system_views.sql
++++ b/src/backend/catalog/system_views.sql
+@@ -970,7 +970,9 @@ CREATE VIEW pg_stat_ssl AS
+             S.sslbits AS bits,
+             S.ssl_client_dn AS client_dn,
+             S.ssl_client_serial AS client_serial,
+-            S.ssl_issuer_dn AS issuer_dn
++            S.ssl_issuer_dn AS issuer_dn,
++            S.ssl_not_before AS not_before,
++            S.ssl_not_after AS not_after
+     FROM pg_stat_get_activity(NULL) AS S
+     WHERE S.client_port IS NOT NULL;
+ 
+diff --git a/src/backend/libpq/be-secure-openssl.c b/src/backend/libpq/be-secure-openssl.c
+index 658b09988d..e31bbeab23 100644
+--- a/src/backend/libpq/be-secure-openssl.c
++++ b/src/backend/libpq/be-secure-openssl.c
+@@ -72,6 +72,7 @@ static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
+ static const char *SSLerrmessage(unsigned long ecode);
+ 
+ static char *X509_NAME_to_cstring(X509_NAME *name);
++static char *ASN1_TIME_to_cstring(ASN1_TIME *time);
+ 
+ static SSL_CTX *SSL_context = NULL;
+ static bool SSL_initialized = false;
+@@ -1406,6 +1407,24 @@ be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len)
+ 		ptr[0] = '\0';
+ }
+ 
++void
++be_tls_get_peer_not_before(Port *port, char *ptr, size_t len)
++{
++	if (port->peer)
++		strlcpy(ptr, ASN1_TIME_to_cstring(X509_getm_notBefore(port->peer)), len);
++	else
++		ptr[0] = '\0';
++}
++
++void
++be_tls_get_peer_not_after(Port *port, char *ptr, size_t len)
++{
++	if (port->peer)
++		strlcpy(ptr, ASN1_TIME_to_cstring(X509_getm_notAfter(port->peer)), len);
++	else
++		ptr[0] = '\0';
++}
++
+ void
+ be_tls_get_peer_serial(Port *port, char *ptr, size_t len)
+ {
+@@ -1549,6 +1568,27 @@ X509_NAME_to_cstring(X509_NAME *name)
+ 	return result;
+ }
+ 
++/*
++ * Convert an ASN1_TIME to a cstring in format of YYYY-MM-DDThh:mm:ssZ.
++ */
++static char *
++ASN1_TIME_to_cstring(ASN1_TIME * time)
++{
++	struct tm 	tm_time;
++	char		str_time[NAMEDATALEN];
++	char	   	*result;
++
++	ASN1_TIME_to_tm(time, &tm_time);
++
++	memset(str_time, 0, sizeof(str_time));
++	snprintf(str_time, sizeof(str_time), "%04d-%02d-%02dT%02d:%02d:%02dZ",
++			tm_time.tm_year+1900, tm_time.tm_mon+1, tm_time.tm_mday,
++			tm_time.tm_hour, tm_time.tm_min, tm_time.tm_sec);
++
++	result = pstrdup(str_time);
++	return result;
++}
++
+ /*
+  * Convert TLS protocol version GUC enum to OpenSSL values
+  *
+diff --git a/src/backend/utils/activity/backend_status.c b/src/backend/utils/activity/backend_status.c
+index 38f91a495b..a9e6f21501 100644
+--- a/src/backend/utils/activity/backend_status.c
++++ b/src/backend/utils/activity/backend_status.c
+@@ -367,6 +367,8 @@ pgstat_bestart(void)
+ 		be_tls_get_peer_subject_name(MyProcPort, lsslstatus.ssl_client_dn, NAMEDATALEN);
+ 		be_tls_get_peer_serial(MyProcPort, lsslstatus.ssl_client_serial, NAMEDATALEN);
+ 		be_tls_get_peer_issuer_name(MyProcPort, lsslstatus.ssl_issuer_dn, NAMEDATALEN);
++		be_tls_get_peer_not_before(MyProcPort, lsslstatus.ssl_not_before, NAMEDATALEN);
++		be_tls_get_peer_not_after(MyProcPort, lsslstatus.ssl_not_after, NAMEDATALEN);
+ 	}
+ 	else
+ 	{
+diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
+index 2a4c8ef87f..c90256e851 100644
+--- a/src/backend/utils/adt/pgstatfuncs.c
++++ b/src/backend/utils/adt/pgstatfuncs.c
+@@ -303,7 +303,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
+ Datum
+ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ {
+-#define PG_STAT_GET_ACTIVITY_COLS	31
++#define PG_STAT_GET_ACTIVITY_COLS	33
+ 	int			num_backends = pgstat_fetch_stat_numbackends();
+ 	int			curr_backend;
+ 	int			pid = PG_ARGISNULL(0) ? -1 : PG_GETARG_INT32(0);
+@@ -395,7 +395,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ 			pfree(clipped_activity);
+ 
+ 			/* leader_pid */
+-			nulls[29] = true;
++			nulls[31] = true;
+ 
+ 			proc = BackendPidGetProc(beentry->st_procpid);
+ 
+@@ -432,8 +432,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ 				 */
+ 				if (leader && leader->pid != beentry->st_procpid)
+ 				{
+-					values[29] = Int32GetDatum(leader->pid);
+-					nulls[29] = false;
++					values[31] = Int32GetDatum(leader->pid);
++					nulls[31] = false;
+ 				}
+ 				else if (beentry->st_backendType == B_BG_WORKER)
+ 				{
+@@ -441,8 +441,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ 
+ 					if (leader_pid != InvalidPid)
+ 					{
+-						values[29] = Int32GetDatum(leader_pid);
+-						nulls[29] = false;
++						values[31] = Int32GetDatum(leader_pid);
++						nulls[31] = false;
+ 					}
+ 				}
+ 			}
+@@ -587,35 +587,45 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ 					values[24] = CStringGetTextDatum(beentry->st_sslstatus->ssl_issuer_dn);
+ 				else
+ 					nulls[24] = true;
++
++				if (beentry->st_sslstatus->ssl_not_before[0])
++					values[25] = CStringGetTextDatum(beentry->st_sslstatus->ssl_not_before);
++				else
++					nulls[25] = true;
++
++				if (beentry->st_sslstatus->ssl_not_after[0])
++					values[26] = CStringGetTextDatum(beentry->st_sslstatus->ssl_not_after);
++				else
++					nulls[26] = true;
+ 			}
+ 			else
+ 			{
+ 				values[18] = BoolGetDatum(false);	/* ssl */
+-				nulls[19] = nulls[20] = nulls[21] = nulls[22] = nulls[23] = nulls[24] = true;
++				nulls[19] = nulls[20] = nulls[21] = nulls[22] = nulls[23] = nulls[24] = nulls[25] = nulls[26] = true;
+ 			}
+ 
+ 			/* GSSAPI information */
+ 			if (beentry->st_gss)
+ 			{
+-				values[25] = BoolGetDatum(beentry->st_gssstatus->gss_auth); /* gss_auth */
+-				values[26] = CStringGetTextDatum(beentry->st_gssstatus->gss_princ);
+-				values[27] = BoolGetDatum(beentry->st_gssstatus->gss_enc);	/* GSS Encryption in use */
+-				values[28] = BoolGetDatum(beentry->st_gssstatus->gss_delegation);	/* GSS credentials
++				values[27] = BoolGetDatum(beentry->st_gssstatus->gss_auth); /* gss_auth */
++				values[28] = CStringGetTextDatum(beentry->st_gssstatus->gss_princ);
++				values[29] = BoolGetDatum(beentry->st_gssstatus->gss_enc);	/* GSS Encryption in use */
++				values[30] = BoolGetDatum(beentry->st_gssstatus->gss_delegation);	/* GSS credentials
+ 																					 * delegated */
+ 			}
+ 			else
+ 			{
+-				values[25] = BoolGetDatum(false);	/* gss_auth */
+-				nulls[26] = true;	/* No GSS principal */
+-				values[27] = BoolGetDatum(false);	/* GSS Encryption not in
++				values[27] = BoolGetDatum(false);	/* gss_auth */
++				nulls[28] = true;	/* No GSS principal */
++				values[29] = BoolGetDatum(false);	/* GSS Encryption not in
+ 													 * use */
+-				values[28] = BoolGetDatum(false);	/* GSS credentials not
++				values[30] = BoolGetDatum(false);	/* GSS credentials not
+ 													 * delegated */
+ 			}
+ 			if (beentry->st_query_id == 0)
+-				nulls[30] = true;
++				nulls[32] = true;
+ 			else
+-				values[30] = UInt64GetDatum(beentry->st_query_id);
++				values[32] = UInt64GetDatum(beentry->st_query_id);
+ 		}
+ 		else
+ 		{
+@@ -645,6 +655,8 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
+ 			nulls[28] = true;
+ 			nulls[29] = true;
+ 			nulls[30] = true;
++			nulls[31] = true;
++			nulls[32] = true;
+ 		}
+ 
+ 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 6996073989..7e71d80a48 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -5413,9 +5413,9 @@
+   proname => 'pg_stat_get_activity', prorows => '100', proisstrict => 'f',
+   proretset => 't', provolatile => 's', proparallel => 'r',
+   prorettype => 'record', proargtypes => 'int4',
+-  proallargtypes => '{int4,oid,int4,oid,text,text,text,text,text,timestamptz,timestamptz,timestamptz,timestamptz,inet,text,int4,xid,xid,text,bool,text,text,int4,text,numeric,text,bool,text,bool,bool,int4,int8}',
+-  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+-  proargnames => '{pid,datid,pid,usesysid,application_name,state,query,wait_event_type,wait_event,xact_start,query_start,backend_start,state_change,client_addr,client_hostname,client_port,backend_xid,backend_xmin,backend_type,ssl,sslversion,sslcipher,sslbits,ssl_client_dn,ssl_client_serial,ssl_issuer_dn,gss_auth,gss_princ,gss_enc,gss_delegation,leader_pid,query_id}',
++  proallargtypes => '{int4,oid,int4,oid,text,text,text,text,text,timestamptz,timestamptz,timestamptz,timestamptz,inet,text,int4,xid,xid,text,bool,text,text,int4,text,numeric,text,text,text,bool,text,bool,bool,int4,int8}',
++  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
++  proargnames => '{pid,datid,pid,usesysid,application_name,state,query,wait_event_type,wait_event,xact_start,query_start,backend_start,state_change,client_addr,client_hostname,client_port,backend_xid,backend_xmin,backend_type,ssl,sslversion,sslcipher,sslbits,ssl_client_dn,ssl_client_serial,ssl_issuer_dn,ssl_not_before,ssl_not_after,gss_auth,gss_princ,gss_enc,gss_delegation,leader_pid,query_id}',
+   prosrc => 'pg_stat_get_activity' },
+ { oid => '3318',
+   descr => 'statistics: information about progress of backends running maintenance command',
+diff --git a/src/include/libpq/libpq-be.h b/src/include/libpq/libpq-be.h
+index a0b74c8095..d94fb46927 100644
+--- a/src/include/libpq/libpq-be.h
++++ b/src/include/libpq/libpq-be.h
+@@ -298,6 +298,8 @@ extern const char *be_tls_get_cipher(Port *port);
+ extern void be_tls_get_peer_subject_name(Port *port, char *ptr, size_t len);
+ extern void be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len);
+ extern void be_tls_get_peer_serial(Port *port, char *ptr, size_t len);
++extern void be_tls_get_peer_not_before(Port *port, char *ptr, size_t len);
++extern void be_tls_get_peer_not_after(Port *port, char *ptr, size_t len);
+ 
+ /*
+  * Get the server certificate hash for SCRAM channel binding type
+diff --git a/src/include/utils/backend_status.h b/src/include/utils/backend_status.h
+index 77939a0aed..f9277454e4 100644
+--- a/src/include/utils/backend_status.h
++++ b/src/include/utils/backend_status.h
+@@ -61,6 +61,8 @@ typedef struct PgBackendSSLStatus
+ 	char		ssl_client_serial[NAMEDATALEN];
+ 
+ 	char		ssl_issuer_dn[NAMEDATALEN];
++	char		ssl_not_before[NAMEDATALEN];
++	char		ssl_not_after[NAMEDATALEN];
+ } PgBackendSSLStatus;
+ 
+ /*
+diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
+index 7fd81e6a7d..231c01113a 100644
+--- a/src/test/regress/expected/rules.out
++++ b/src/test/regress/expected/rules.out
+@@ -1760,7 +1760,7 @@ pg_stat_activity| SELECT s.datid,
+     s.query_id,
+     s.query,
+     s.backend_type
+-   FROM ((pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
++   FROM ((pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, ssl_not_before, ssl_not_after, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
+      LEFT JOIN pg_database d ON ((s.datid = d.oid)))
+      LEFT JOIN pg_authid u ON ((s.usesysid = u.oid)));
+ pg_stat_all_indexes| SELECT c.oid AS relid,
+@@ -1878,7 +1878,7 @@ pg_stat_gssapi| SELECT pid,
+     gss_princ AS principal,
+     gss_enc AS encrypted,
+     gss_delegation AS credentials_delegated
+-   FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
++   FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, ssl_not_before, ssl_not_after, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
+   WHERE (client_port IS NOT NULL);
+ pg_stat_io| SELECT backend_type,
+     object,
+@@ -2078,7 +2078,7 @@ pg_stat_replication| SELECT s.pid,
+     w.sync_priority,
+     w.sync_state,
+     w.reply_time
+-   FROM ((pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
++   FROM ((pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, ssl_not_before, ssl_not_after, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
+      JOIN pg_stat_get_wal_senders() w(pid, state, sent_lsn, write_lsn, flush_lsn, replay_lsn, write_lag, flush_lag, replay_lag, sync_priority, sync_state, reply_time) ON ((s.pid = w.pid)))
+      LEFT JOIN pg_authid u ON ((s.usesysid = u.oid)));
+ pg_stat_replication_slots| SELECT s.slot_name,
+@@ -2111,8 +2111,10 @@ pg_stat_ssl| SELECT pid,
+     sslbits AS bits,
+     ssl_client_dn AS client_dn,
+     ssl_client_serial AS client_serial,
+-    ssl_issuer_dn AS issuer_dn
+-   FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
++    ssl_issuer_dn AS issuer_dn,
++    ssl_not_before AS not_before,
++    ssl_not_after AS not_after
++   FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid, application_name, state, query, wait_event_type, wait_event, xact_start, query_start, backend_start, state_change, client_addr, client_hostname, client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion, sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn, ssl_not_before, ssl_not_after, gss_auth, gss_princ, gss_enc, gss_delegation, leader_pid, query_id)
+   WHERE (client_port IS NOT NULL);
+ pg_stat_subscription| SELECT su.oid AS subid,
+     su.subname,
+diff --git a/src/test/ssl/t/001_ssltests.pl b/src/test/ssl/t/001_ssltests.pl
+index 76442de063..e9db6fd060 100644
+--- a/src/test/ssl/t/001_ssltests.pl
++++ b/src/test/ssl/t/001_ssltests.pl
+@@ -543,8 +543,8 @@ command_like(
+ 		"$common_connstr sslrootcert=invalid", '-c',
+ 		"SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+ 	],
+-	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn\r?\n
+-				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,_null_,_null_,_null_\r?$}mx,
++	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn,not_before,not_after\r?\n
++				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,_null_,_null_,_null_,_null_,_null_\r?$}mx,
+ 	'pg_stat_ssl view without client certificate');
+ 
+ # Test min/max SSL protocol versions.
+@@ -745,8 +745,8 @@ command_like(
+ 		'-c',
+ 		"SELECT * FROM pg_stat_ssl WHERE pid = pg_backend_pid()"
+ 	],
+-	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn\r?\n
+-				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,/?CN=ssltestuser,$serialno,/?\QCN=Test CA for PostgreSQL SSL regression test client certs\E\r?$}mx,
++	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn,not_before,not_after\r?\n
++				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,/?CN=ssltestuser,$serialno,/?\QCN=Test CA for PostgreSQL SSL regression test client certs\E,2021-03-03T22:12:07Z,2048-07-19T22:12:07Z\r?$}mx,
+ 	'pg_stat_ssl with client certificate');
+ 
+ # client key with wrong permissions
