@@ -1,0 +1,50 @@
+From b12486fb9ec4ed1b892ac00ad6904e3828ef16e2 Mon Sep 17 00:00:00 2001
+From: David Zhang <idrawone@gmail.com>
+Date: Thu, 10 Aug 2023 11:42:14 -0700
+Subject: [PATCH] a simple SQL system function
+
+---
+ src/backend/utils/adt/numeric.c | 16 ++++++++++++++++
+ src/include/catalog/pg_proc.dat |  4 ++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/src/backend/utils/adt/numeric.c b/src/backend/utils/adt/numeric.c
+index a1c9d69869..fa8bb7cdd6 100644
+--- a/src/backend/utils/adt/numeric.c
++++ b/src/backend/utils/adt/numeric.c
+@@ -11482,3 +11482,19 @@ accum_sum_combine(NumericSumAccum *accum, NumericSumAccum *accum2)
+ 
+ 	free_var(&tmp_var);
+ }
++
++Datum
++get_sum(PG_FUNCTION_ARGS)
++{
++	int32       a;
++	int32       b;
++
++	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
++	{
++		elog(ERROR, "two integers are reuquired as the input.");
++		PG_RETURN_NULL();
++	}
++	a = PG_GETARG_INT32(0);
++	b = PG_GETARG_INT32(1);
++	PG_RETURN_INT64(a + b);
++}
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 8de88348ec..ed6af18678 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -11812,4 +11812,8 @@
+   prorettype => 'bytea', proargtypes => 'pg_brin_minmax_multi_summary',
+   prosrc => 'brin_minmax_multi_summary_send' },
+ 
++{ oid => '6301', descr => 'get the sum of two integers',
++  proname => 'get_sum', proisstrict => 'f', prorettype => 'int8',
++  proargtypes => 'int4 int4', prosrc => 'get_sum' },
++
+ ]
+-- 
+2.34.1
+

@@ -1,0 +1,95 @@
+-- 1. 查询语言函数
+CREATE OR REPLACE FUNCTION one() RETURNS integer AS $$
+    SELECT 1 AS result;
+$$ LANGUAGE SQL;
+
+CREATE OR REPLACE FUNCTION one() RETURNS integer AS '
+    SELECT 1 AS result;
+' LANGUAGE SQL;
+
+SELECT one();
+DROP FUNCTION one ;
+
+
+
+-- 2. 过程语言函数
+-- pl/pgsql过程语言函数
+CREATE OR REPLACE FUNCTION pgsql_get_sum(INT, INT) RETURNS INT LANGUAGE PLPGSQL
+as $$
+BEGIN 
+        return $1 + $2; 
+END
+$$;
+
+SELECT pgsql_get_sum(12, 12);
+DROP FUNCTION pgsql_get_sum;
+
+
+-- pl/tcl过程语言函数
+CREATE EXTENSION pltcl;
+
+CREATE OR REPLACE FUNCTION tcl_get_sum(INT, INT) RETURNS INT AS '
+    return [expr $1 + $2]
+' LANGUAGE pltcl;
+
+SELECT tcl_get_sum(12, 12);
+DROP FUNCTION tcl_get_sum;
+
+
+-- pl/perl过程语言函数
+CREATE EXTENSION plperl;
+
+CREATE OR REPLACE FUNCTION perl_get_sum(int, int) RETURNS INTEGER AS $$
+return $_[0] + $_[1];
+$$ LANGUAGE plperl;
+
+SELECT perl_get_sum(12, 12);
+DROP FUNCTION perl_get_sum;
+
+
+-- pl/python过程语言函数
+CREATE EXTENSION plpython3u;
+
+CREATE OR REPLACE FUNCTION python_get_sum(x INT, y INT) RETURNS INT AS $$
+z = x + y
+return z
+$$ LANGUAGE plpython3u;
+
+SELECT python_get_sum(12, 12);
+DROP FUNCTION python_get_sum;
+
+
+
+-- 3. 内部函数
+CREATE OR REPLACE FUNCTION square_root(double precision) RETURNS double precision
+    AS 'dsqrt'
+    LANGUAGE internal
+    STRICT;
+
+
+
+-- 4. C语言函数
+###
+cd get_sum
+ls -l
+gcc -I $(pg_config --includedir)/postgresql/server -shared -o get_sum.so get_sum.c
+ls -l
+cp -pr get_sum.so $(pg_config —pkglibdir)/
+
+CREATE OR REPLACE FUNCTION get_sum(integer, integer) RETURNS integer
+     AS '$libdir/get_sum', 'get_sum'
+     LANGUAGE C STRICT;
+
+SELECT get_sum(1::INT, 1::INT);
+
+
+
+-- 如何将自定义C函数加入到系统内部-1
+src/include/catalog/pg_proc.dat
+
+
+
+-- 如何将自定义C函数加入到系统内部-4
+SELECT get_sum(1::INT, 1::INT);
+
+

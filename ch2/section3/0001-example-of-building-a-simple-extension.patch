@@ -1,0 +1,153 @@
+From 21193115c726d3d7c9915a24c82438d14dedf834 Mon Sep 17 00:00:00 2001
+From: David Zhang <david@MacBookDZ.local>
+Date: Tue, 8 Aug 2023 15:58:33 -0700
+Subject: [PATCH] example of building a simple extension
+
+---
+ contrib/get_sum/Makefile                | 19 ++++++++++++++++++
+ contrib/get_sum/expected/get_sum_t1.out | 23 ++++++++++++++++++++++
+ contrib/get_sum/get_sum--1.0.sql        | 10 ++++++++++
+ contrib/get_sum/get_sum.c               | 26 +++++++++++++++++++++++++
+ contrib/get_sum/get_sum.control         | 10 ++++++++++
+ contrib/get_sum/sql/get_sum_t1.sql      |  6 ++++++
+ 6 files changed, 94 insertions(+)
+ create mode 100644 contrib/get_sum/Makefile
+ create mode 100644 contrib/get_sum/expected/get_sum_t1.out
+ create mode 100644 contrib/get_sum/get_sum--1.0.sql
+ create mode 100644 contrib/get_sum/get_sum.c
+ create mode 100644 contrib/get_sum/get_sum.control
+ create mode 100644 contrib/get_sum/sql/get_sum_t1.sql
+
+diff --git a/contrib/get_sum/Makefile b/contrib/get_sum/Makefile
+new file mode 100644
+index 0000000000..45143fe965
+--- /dev/null
++++ b/contrib/get_sum/Makefile
+@@ -0,0 +1,19 @@
++MODULES = get_sum
++
++EXTENSION = get_sum 		# the extersion's name
++
++DATA = get_sum--1.0.sql	# script file to install
++
++REGRESS = get_sum_t1		# the test script file
++ 
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = contrib/get_sum
++top_builddir = ../..
++include $(top_builddir)/src/Makefile.global
++include $(top_srcdir)/contrib/contrib-global.mk
++endif
+diff --git a/contrib/get_sum/expected/get_sum_t1.out b/contrib/get_sum/expected/get_sum_t1.out
+new file mode 100644
+index 0000000000..942f438c8e
+--- /dev/null
++++ b/contrib/get_sum/expected/get_sum_t1.out
+@@ -0,0 +1,23 @@
++CREATE EXTENSION get_sum;
++SELECT get_sum(1::INT, 1::INT);
++ get_sum 
++---------
++       2
++(1 row)
++
++SELECT get_sum(-1::INT, -1::INT);
++ get_sum 
++---------
++      -2
++(1 row)
++
++SELECT get_sum(NULL::INT, 11::INT);
++ get_sum 
++---------
++        
++(1 row)
++
++SELECT get_sum(2147483647::INT, -2147483648::INT);
++ERROR:  integer out of range
++SELECT get_sum(111111111111111::INT, 222222222222222::INT);
++ERROR:  integer out of range
+diff --git a/contrib/get_sum/get_sum--1.0.sql b/contrib/get_sum/get_sum--1.0.sql
+new file mode 100644
+index 0000000000..0ffbf71edc
+--- /dev/null
++++ b/contrib/get_sum/get_sum--1.0.sql
+@@ -0,0 +1,10 @@
++--complain if script is sourced in psql, rather than via CREATE EXTENSION
++
++
++\echo Use "CREATE EXTENSION get_sum" to load this file. \quit
++
++ 
++CREATE OR REPLACE FUNCTION get_sum(int, int) RETURNS int
++AS '$libdir/get_sum'
++LANGUAGE C IMMUTABLE STRICT;
++
+diff --git a/contrib/get_sum/get_sum.c b/contrib/get_sum/get_sum.c
+new file mode 100644
+index 0000000000..a3e223b06d
+--- /dev/null
++++ b/contrib/get_sum/get_sum.c
+@@ -0,0 +1,26 @@
++#include "postgres.h"
++#include "fmgr.h"
++
++PG_MODULE_MAGIC;
++
++PG_FUNCTION_INFO_V1(get_sum);
++
++Datum
++get_sum(PG_FUNCTION_ARGS)
++{
++    bool isnull, isnull2;
++    int a = 0, b = 0, sum = 0;
++
++    isnull = PG_ARGISNULL(0);
++    isnull2 = PG_ARGISNULL(1);
++    if (isnull || isnull2)
++      ereport( ERROR,
++               ( errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++               errmsg("the input must be two integers")));
++
++    a = PG_GETARG_INT32(0);
++    b = PG_GETARG_INT32(1);
++    sum = a + b;
++
++    PG_RETURN_INT32(sum);
++}
+diff --git a/contrib/get_sum/get_sum.control b/contrib/get_sum/get_sum.control
+new file mode 100644
+index 0000000000..76741ba1a9
+--- /dev/null
++++ b/contrib/get_sum/get_sum.control
+@@ -0,0 +1,10 @@
++# get_sum postgresql extension
++
++comment = 'extension for a sum of two integers'
++
++default_version = '1.0'
++
++module_pathname = '$libdir/get_sum'
++
++relocatable = true
++
+diff --git a/contrib/get_sum/sql/get_sum_t1.sql b/contrib/get_sum/sql/get_sum_t1.sql
+new file mode 100644
+index 0000000000..c5613152a1
+--- /dev/null
++++ b/contrib/get_sum/sql/get_sum_t1.sql
+@@ -0,0 +1,6 @@
++CREATE EXTENSION get_sum;
++SELECT get_sum(1::INT, 1::INT);
++SELECT get_sum(-1::INT, -1::INT);
++SELECT get_sum(NULL::INT, 11::INT);
++SELECT get_sum(2147483647::INT, -2147483648::INT);
++SELECT get_sum(111111111111111::INT, 222222222222222::INT);
+-- 
+2.39.0
+
