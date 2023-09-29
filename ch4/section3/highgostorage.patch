@@ -1,0 +1,608 @@
+diff --git a/src/test/modules/highgoStorage/Makefile b/src/test/modules/highgoStorage/Makefile
+new file mode 100644
+index 0000000000..eba1450dce
+--- /dev/null
++++ b/src/test/modules/highgoStorage/Makefile
+@@ -0,0 +1,24 @@
++# src/test/modules/highgoStorage/Makefile
++
++MODULE_big = highgostorage
++OBJS = highgostorage.o $(WIN32RES)
++PGFILEDESC = "A test implementantation of Pluggable storage API"
++
++EXTENSION = highgostorage
++DATA = highgostorage--1.0.sql
++
++
++ifdef USE_PGXS
++PG_CONFIG = pg_config
++PGXS := $(shell $(PG_CONFIG) --pgxs)
++include $(PGXS)
++else
++subdir = src/test/modules/highgoStorage
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++include $(top_srcdir)/contrib/contrib-global.mk
++endif
++
++OBJS = highgostorage.o
++
++include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/test/modules/highgoStorage/highgostorage--1.0.sql b/src/test/modules/highgoStorage/highgostorage--1.0.sql
+new file mode 100644
+index 0000000000..2a5a8c6e1a
+--- /dev/null
++++ b/src/test/modules/highgoStorage/highgostorage--1.0.sql
+@@ -0,0 +1,12 @@
++/* src/test/modules/highgoStorage/highgostorage--1.0.sql */
++
++-- complain if script is sourced in psql, rather than via CREATE EXTENSION
++\echo Use "CREATE EXTENSION highgostorage" to load this file. \quit
++
++CREATE FUNCTION highgostorage_handler(internal)
++RETURNS pg_catalog.table_am_handler STRICT
++AS 'MODULE_PATHNAME' LANGUAGE C;
++
++CREATE ACCESS METHOD highgostorage TYPE TABLE HANDLER highgostorage_handler
++
++
+diff --git a/src/test/modules/highgoStorage/highgostorage.c b/src/test/modules/highgoStorage/highgostorage.c
+new file mode 100644
+index 0000000000..51516fa1d1
+--- /dev/null
++++ b/src/test/modules/highgoStorage/highgostorage.c
+@@ -0,0 +1,544 @@
++#include "postgres.h"
++
++#include <math.h>
++
++#include "miscadmin.h"
++
++#include "access/multixact.h"
++#include "access/relscan.h"
++#include "access/tableam.h"
++#include "catalog/catalog.h"
++#include "catalog/storage.h"
++#include "catalog/index.h"
++#include "catalog/pg_type.h"
++#include "executor/executor.h"
++#include "utils/builtins.h"
++#include "utils/rel.h"
++#include "storage/bufmgr.h"
++
++PG_MODULE_MAGIC;
++
++PG_FUNCTION_INFO_V1(highgostorage_handler);
++
++typedef struct
++{
++	TableScanDescData scan;
++
++	int			tupidx;
++} HighgoScanDescData;
++typedef HighgoScanDescData *HighgoScanDesc;
++
++#define MAXDATA 1000
++#define MAXCOL 10
++static Datum mydata[MAXDATA][MAXCOL] = {0};
++static bool mynull[MAXDATA][MAXCOL] = {0};
++static int numData = 0;
++
++static const TupleTableSlotOps *
++highgo_slot_callbacks(Relation relation)
++{
++	return &TTSOpsVirtual;
++}
++
++static TableScanDesc highgo_scan_begin(Relation rel,
++							 Snapshot snapshot,
++							 int nkeys, struct ScanKeyData *key,
++							 ParallelTableScanDesc pscan,
++							 uint32 flags)
++{
++	HighgoScanDesc tscan;
++
++	tscan = palloc0(sizeof(HighgoScanDescData));
++	tscan->scan.rs_rd = rel;
++	tscan->scan.rs_snapshot = snapshot;
++	tscan->scan.rs_nkeys = nkeys;
++	tscan->scan.rs_parallel = pscan;
++	tscan->scan.rs_flags = flags;
++
++	tscan->tupidx = 0;
++
++	return &tscan->scan;
++}
++static bool
++highgo_tuple_tid_valid (TableScanDesc scan, ItemPointer tid)
++{
++	return true;
++}
++
++static void
++highgo_scan_end(TableScanDesc scan)
++{
++	pfree(scan);
++}
++
++static void
++highgo_scan_rescan(TableScanDesc scan, struct ScanKeyData *key,
++				  bool set_params, bool allow_strat,
++				  bool allow_sync, bool allow_pagemode)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static bool
++highgo_scan_getnextslot(TableScanDesc scan,
++					   ScanDirection direction,
++					   TupleTableSlot *slot)
++{
++	HighgoScanDesc tscan = (HighgoScanDesc) scan;
++
++	slot->tts_nvalid = 0;
++	slot->tts_flags |= TTS_FLAG_EMPTY;
++
++	if (tscan->tupidx < numData)
++	{
++		TupleDesc desc = RelationGetDescr(tscan->scan.rs_rd);
++		for (AttrNumber attno = 0; attno < desc->natts; attno++)
++		{
++			slot->tts_values[attno] = mydata[tscan->tupidx][attno];
++			slot->tts_isnull[attno] = mynull[tscan->tupidx][attno];
++		}
++
++		ItemPointerSet(&slot->tts_tid, 1, tscan->tupidx);
++		slot->tts_nvalid = slot->tts_tupleDescriptor->natts;
++		slot->tts_flags &= ~TTS_FLAG_EMPTY;
++		tscan->tupidx++;
++		return true;
++	}
++	else
++		return false;
++}
++
++static Size
++highgo_parallelscan_estimate(Relation rel)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static Size
++highgo_parallelscan_initialize(Relation rel,
++							  ParallelTableScanDesc pscan)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_parallelscan_reinitialize(Relation rel,
++								ParallelTableScanDesc pscan)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static struct IndexFetchTableData *
++highgo_index_fetch_begin(Relation rel)
++{
++	IndexFetchTableData *tfetch = palloc0(sizeof(IndexFetchTableData));
++
++	tfetch->rel = rel;
++
++	return tfetch;
++}
++
++static void
++highgo_index_fetch_reset(struct IndexFetchTableData *data)
++{
++	return;
++}
++
++static void
++highgo_index_fetch_end(struct IndexFetchTableData *data)
++{
++	pfree(data);
++}
++
++static bool
++highgo_index_fetch_tuple(struct IndexFetchTableData *scan,
++						ItemPointer tid,
++						Snapshot snapshot,
++						TupleTableSlot *slot,
++						bool *call_again, bool *all_dead)
++{
++
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++
++}
++
++static bool
++highgo_tuple_fetch_row_version(Relation rel,
++							  ItemPointer tid,
++							  Snapshot snapshot,
++							  TupleTableSlot *slot)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++static void
++highgo_tuple_get_latest_tid(TableScanDesc scan,
++						   ItemPointer tid)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static bool
++highgo_tuple_satisfies_snapshot(Relation rel,
++							   TupleTableSlot *slot,
++							   Snapshot snapshot)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_tuple_insert(Relation rel, TupleTableSlot *slot,
++				   CommandId cid, int options,
++				   struct BulkInsertStateData *bistate)
++{
++	int i = 0;
++	if (numData >= MAXDATA)
++		elog(ERROR, "data full");
++
++	for (i = 0; i < (rel->rd_att->natts > MAXCOL ? MAXCOL : rel->rd_att->natts); i++)
++	{
++		mydata[numData][i] = slot->tts_values[i];
++		mynull[numData][i] = slot->tts_isnull[i];
++	}
++	numData++;
++}
++
++static void
++highgo_tuple_insert_speculative(Relation rel,
++							   TupleTableSlot *slot,
++							   CommandId cid,
++							   int options,
++							   struct BulkInsertStateData *bistate,
++							   uint32 specToken)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_tuple_complete_speculative(Relation rel,
++								 TupleTableSlot *slot,
++								 uint32 specToken,
++								 bool succeeded)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static TM_Result
++highgo_tuple_delete(Relation rel,
++				   ItemPointer tid,
++				   CommandId cid,
++				   Snapshot snapshot,
++				   Snapshot crosscheck,
++				   bool wait,
++				   TM_FailureData *tmfd,
++				   bool changingPart)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
++				   CommandId cid, int options, struct BulkInsertStateData *bistate)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static TM_Result
++highgo_tuple_update(Relation rel,
++				   ItemPointer otid,
++				   TupleTableSlot *slot,
++				   CommandId cid,
++				   Snapshot snapshot,
++				   Snapshot crosscheck,
++				   bool wait,
++				   TM_FailureData *tmfd,
++				   LockTupleMode *lockmode,
++				   bool *update_indexes)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static TM_Result
++highgo_tuple_lock(Relation rel,
++				 ItemPointer tid,
++				 Snapshot snapshot,
++				 TupleTableSlot *slot,
++				 CommandId cid,
++				 LockTupleMode mode,
++				 LockWaitPolicy wait_policy,
++				 uint8 flags,
++				 TM_FailureData *tmfd)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_relation_set_new_filenode(Relation rel,
++								const RelFileNode *newrnode,
++								char persistence,
++								TransactionId *freezeXid,
++								MultiXactId *minmulti)
++{
++	*freezeXid = InvalidTransactionId;
++	*minmulti = InvalidMultiXactId;
++
++	/*
++	 * FIXME: We don't need this for anything. But index build calls
++	 * RelationGetNumberOfBlocks, from index_update_stats(), and that
++	 * fails if the underlying file doesn't exist.
++	 */
++	RelationCreateStorage(rel->rd_node, persistence, true);
++}
++
++static void
++highgo_relation_nontransactional_truncate(Relation rel)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++static void
++highgo_relation_copy_data(Relation rel, const RelFileNode *newrnode)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++static void
++highgo_relation_copy_for_cluster(Relation NewTable,
++                                              Relation OldTable,
++                                              Relation OldIndex,
++                                              bool use_sort,
++                                              TransactionId OldestXmin,
++                                              TransactionId *xid_cutoff,
++                                              MultiXactId *multi_cutoff,
++                                              double *num_tuples,
++                                              double *tups_vacuumed,
++                                              double *tups_recently_dead)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_relation_vacuum(Relation onerel,
++					  struct VacuumParams *params,
++					  BufferAccessStrategy bstrategy)
++{
++	/* we've got nothing to do */
++}
++
++static bool
++highgo_scan_analyze_next_block(TableScanDesc scan,
++							  BlockNumber blockno,
++							  BufferAccessStrategy bstrategy)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static bool
++highgo_scan_analyze_next_tuple(TableScanDesc scan,
++							  TransactionId OldestXmin,
++							  double *liverows,
++							  double *deadrows,
++							  TupleTableSlot *slot)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static double
++highgo_index_build_range_scan(Relation heap_rel,
++							 Relation index_rel,
++							 struct IndexInfo *index_nfo,
++							 bool allow_sync,
++							 bool anyvisible,
++							 bool progress,
++							 BlockNumber start_blockno,
++							 BlockNumber end_blockno,
++							 IndexBuildCallback callback,
++							 void *callback_state,
++							 TableScanDesc scan)
++{
++	TupleTableSlot *slot;
++	EState     *estate;
++
++	estate = CreateExecutorState();
++	slot = table_slot_create(heap_rel, NULL);
++
++	if (!scan)
++		scan = highgo_scan_begin(heap_rel,
++								SnapshotAny,
++								0, NULL,
++								NULL,
++								0);
++
++	while (highgo_scan_getnextslot(scan, ForwardScanDirection, slot))
++	{
++		Datum           values[INDEX_MAX_KEYS];
++		bool            isnull[INDEX_MAX_KEYS];
++		HeapTuple		heapTuple;
++
++		FormIndexDatum(index_nfo, slot, estate, values, isnull);
++
++		/* Call the AM's callback routine to process the tuple */
++		heapTuple = ExecCopySlotHeapTuple(slot);
++		heapTuple->t_self = slot->tts_tid;
++		callback(heap_rel, &heapTuple->t_self, values, isnull, true,
++				 callback_state);
++		pfree(heapTuple);
++	}
++
++	highgo_scan_end(scan);
++	ExecDropSingleTupleTableSlot(slot);
++	FreeExecutorState(estate);
++
++	return 10;
++}
++
++static void
++highgo_index_validate_scan(Relation heap_rel,
++						  Relation index_rel,
++						  struct IndexInfo *index_info,
++						  Snapshot snapshot,
++						  struct ValidateIndexState *state)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static void
++highgo_relation_estimate_size(Relation rel, int32 *attr_widths,
++							 BlockNumber *pages, double *tuples,
++							 double *allvisfrac)
++{
++	*pages = 1;
++	*tuples = numData;
++	*allvisfrac = 1.0;
++}
++
++static bool
++highgo_scan_sample_next_block(TableScanDesc scan,
++							 struct SampleScanState *scanstate)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static bool
++highgo_scan_sample_next_tuple(TableScanDesc scan,
++					   struct SampleScanState *scanstate,
++					   TupleTableSlot *slot)
++{
++	ereport(ERROR,
++			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++			 errmsg("I am working on implementing %s function", __func__)));
++}
++
++static uint64
++highgo_relation_size (Relation rel, ForkNumber forkNumber)
++{
++	return sizeof(mydata);
++}
++
++static bool
++highgo_relation_needs_toast_table (Relation rel)
++{
++	return false;
++}
++static const TableAmRoutine highgo_methods = {
++	.type = T_TableAmRoutine,
++
++	.slot_callbacks = highgo_slot_callbacks,
++
++	.scan_begin = highgo_scan_begin,
++	.scan_end = highgo_scan_end,
++	.scan_rescan = highgo_scan_rescan,
++	.scan_getnextslot = highgo_scan_getnextslot,
++
++	.scan_set_tidrange = NULL,
++	.scan_getnextslot_tidrange = NULL,
++
++	.parallelscan_estimate = highgo_parallelscan_estimate,
++	.parallelscan_initialize = highgo_parallelscan_initialize,
++	.parallelscan_reinitialize = highgo_parallelscan_reinitialize,
++
++	.index_fetch_begin = highgo_index_fetch_begin,
++	.index_fetch_reset = highgo_index_fetch_reset,
++	.index_fetch_end = highgo_index_fetch_end,
++	.index_fetch_tuple = highgo_index_fetch_tuple,
++
++	.tuple_insert = highgo_tuple_insert,
++	.tuple_insert_speculative = highgo_tuple_insert_speculative,
++	.tuple_complete_speculative = highgo_tuple_complete_speculative,
++	.multi_insert = highgo_multi_insert,
++	.tuple_delete = highgo_tuple_delete,
++	.tuple_update = highgo_tuple_update,
++	.tuple_lock = highgo_tuple_lock,
++	.tuple_fetch_row_version = highgo_tuple_fetch_row_version,
++	.tuple_get_latest_tid = highgo_tuple_get_latest_tid,
++	.tuple_tid_valid = highgo_tuple_tid_valid,
++	.tuple_satisfies_snapshot = highgo_tuple_satisfies_snapshot,
++	.index_delete_tuples = NULL,
++
++	.relation_set_new_filenode = highgo_relation_set_new_filenode,
++	.relation_nontransactional_truncate = highgo_relation_nontransactional_truncate,
++	.relation_copy_data = highgo_relation_copy_data,
++	.relation_copy_for_cluster = highgo_relation_copy_for_cluster,
++	.relation_vacuum = highgo_relation_vacuum,
++	.scan_analyze_next_block = highgo_scan_analyze_next_block,
++	.scan_analyze_next_tuple = highgo_scan_analyze_next_tuple,
++	.index_build_range_scan = highgo_index_build_range_scan,
++	.index_validate_scan = highgo_index_validate_scan,
++
++	.relation_size = highgo_relation_size,
++	.relation_needs_toast_table = highgo_relation_needs_toast_table,
++	.relation_toast_am = NULL,
++	.relation_fetch_toast_slice = NULL,
++
++	.relation_estimate_size = highgo_relation_estimate_size,
++
++	.scan_bitmap_next_block = NULL,
++	.scan_bitmap_next_tuple = NULL,
++	.scan_sample_next_block = highgo_scan_sample_next_block,
++	.scan_sample_next_tuple = highgo_scan_sample_next_tuple
++};
++
++Datum
++highgostorage_handler(PG_FUNCTION_ARGS)
++{
++	PG_RETURN_POINTER(&highgo_methods);
++}
+diff --git a/src/test/modules/highgoStorage/highgostorage.control b/src/test/modules/highgoStorage/highgostorage.control
+new file mode 100644
+index 0000000000..efb01bbad5
+--- /dev/null
++++ b/src/test/modules/highgoStorage/highgostorage.control
+@@ -0,0 +1,4 @@
++comment = 'POC test implementation of pluggable storage api'
++default_version = '1.0'
++module_pathname = '$libdir/highgostorage'
++relocatable = true
