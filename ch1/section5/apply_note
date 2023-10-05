@@ -1,0 +1,3 @@
+this patch applies to PostgreSQL tag REL_16_0:
+
+patch -p1 < v5-0002-Add-notBefore-and-notAfter-to-SSL-cert-info-displ.patch
