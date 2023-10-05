@@ -1,19 +1,201 @@
+From e048c524e1da51d1cde5038e464c5bece7a41b06 Mon Sep 17 00:00:00 2001
+From: Daniel Gustafsson <dgustafsson@postgresql.org>
+Date: Thu, 13 Jul 2023 17:50:01 +0200
+Subject: [PATCH v5 2/2] Add notBefore and notAfter to SSL cert info display
+
+This adds the X509 attributes notBefore and notAfter to sslinfo
+as well as pg_stat_ssl to allow verifying and identifying the
+validity period of the current client certificate.
+
+Author: Cary Huang <cary.huang@highgo.ca>
+Discussion: https://postgr.es/m/182b8565486.10af1a86f158715.2387262617218380588@highgo.ca
+---
+ contrib/sslinfo/Makefile                    |  2 +-
+ contrib/sslinfo/meson.build                 |  1 +
+ contrib/sslinfo/sslinfo--1.2--1.3.sql       | 12 ++++
+ contrib/sslinfo/sslinfo.c                   | 67 +++++++++++++++++++++
+ contrib/sslinfo/sslinfo.control             |  2 +-
+ doc/src/sgml/monitoring.sgml                | 20 ++++++
+ doc/src/sgml/sslinfo.sgml                   | 30 +++++++++
+ src/backend/catalog/system_views.sql        |  4 +-
+ src/backend/libpq/be-secure-openssl.c       | 47 +++++++++++++++
+ src/backend/utils/activity/backend_status.c |  2 +
+ src/backend/utils/adt/pgstatfuncs.c         | 46 ++++++++------
+ src/include/catalog/pg_proc.dat             |  6 +-
+ src/include/libpq/libpq-be.h                |  2 +
+ src/include/utils/backend_status.h          |  2 +
+ src/test/regress/expected/rules.out         | 12 ++--
+ src/test/ssl/t/001_ssltests.pl              |  8 +--
+ src/test/ssl/t/003_sslinfo.pl               | 14 +++++
+ 17 files changed, 245 insertions(+), 32 deletions(-)
+ create mode 100644 contrib/sslinfo/sslinfo--1.2--1.3.sql
+
+diff --git a/contrib/sslinfo/Makefile b/contrib/sslinfo/Makefile
+index dd1ff83b16..78a5a83d5c 100644
+--- a/contrib/sslinfo/Makefile
++++ b/contrib/sslinfo/Makefile
+@@ -6,7 +6,7 @@ OBJS = \
+ 	sslinfo.o
+ 
+ EXTENSION = sslinfo
+-DATA = sslinfo--1.2.sql sslinfo--1.1--1.2.sql sslinfo--1.0--1.1.sql
++DATA = sslinfo--1.2--1.3.sql sslinfo--1.2.sql sslinfo--1.1--1.2.sql sslinfo--1.0--1.1.sql
+ PGFILEDESC = "sslinfo - information about client SSL certificate"
+ 
+ ifdef USE_PGXS
+diff --git a/contrib/sslinfo/meson.build b/contrib/sslinfo/meson.build
+index 999456d3a4..215b01daff 100644
+--- a/contrib/sslinfo/meson.build
++++ b/contrib/sslinfo/meson.build
+@@ -26,6 +26,7 @@ install_data(
+   'sslinfo--1.0--1.1.sql',
+   'sslinfo--1.1--1.2.sql',
+   'sslinfo--1.2.sql',
++  'sslinfo--1.2--1.3.sql',
+   'sslinfo.control',
+   kwargs: contrib_data_args,
+ )
+diff --git a/contrib/sslinfo/sslinfo--1.2--1.3.sql b/contrib/sslinfo/sslinfo--1.2--1.3.sql
+new file mode 100644
+index 0000000000..9d64d2bfa4
+--- /dev/null
++++ b/contrib/sslinfo/sslinfo--1.2--1.3.sql
+@@ -0,0 +1,12 @@
++/* contrib/sslinfo/sslinfo--1.2--1.3.sql */
++
++-- complain if script is sourced in psql, rather than via CREATE EXTENSION
++\echo Use "CREATE EXTENSION sslinfo" to load this file. \quit
++
++CREATE FUNCTION ssl_client_get_notbefore() RETURNS timestamp
++AS 'MODULE_PATHNAME', 'ssl_client_get_notbefore'
++LANGUAGE C STRICT PARALLEL RESTRICTED;
++
++CREATE FUNCTION ssl_client_get_notafter() RETURNS timestamp
++AS 'MODULE_PATHNAME', 'ssl_client_get_notafter'
++LANGUAGE C STRICT PARALLEL RESTRICTED;
+diff --git a/contrib/sslinfo/sslinfo.c b/contrib/sslinfo/sslinfo.c
+index 5fd46b9874..e4ecf78889 100644
+--- a/contrib/sslinfo/sslinfo.c
++++ b/contrib/sslinfo/sslinfo.c
+@@ -18,6 +18,7 @@
+ #include "libpq/libpq-be.h"
+ #include "miscadmin.h"
+ #include "utils/builtins.h"
++#include "utils/timestamp.h"
+ 
+ /*
+  * On Windows, <wincrypt.h> includes a #define for X509_NAME, which breaks our
+@@ -34,6 +35,7 @@ PG_MODULE_MAGIC;
+ 
+ static Datum X509_NAME_field_to_text(X509_NAME *name, text *fieldName);
+ static Datum ASN1_STRING_to_text(ASN1_STRING *str);
++static Datum ASN1_TIME_to_timestamp(ASN1_TIME *time);
+ 
+ /*
+  * Function context for data persisting over repeated calls.
+@@ -225,6 +227,39 @@ X509_NAME_field_to_text(X509_NAME *name, text *fieldName)
+ }
+ 
+ 
++/*
++ * Converts OpenSSL ASN1_TIME structure into timestamp
++ *
++ * Parameter: time - OpenSSL ASN1_TIME structure.
++ *
++ * Returns Datum, which can be directly returned from a C language SQL
++ * function.
++ */
++static Datum
++ASN1_TIME_to_timestamp(ASN1_TIME * time)
++{
++	struct tm	tm_time;
++	struct pg_tm pgtm_time;
++	Timestamp	ts;
++
++	ASN1_TIME_to_tm(time, &tm_time);
++
++	pgtm_time.tm_sec = tm_time.tm_sec;
++	pgtm_time.tm_min = tm_time.tm_min;
++	pgtm_time.tm_hour = tm_time.tm_hour;
++	pgtm_time.tm_mday = tm_time.tm_mday;
++	pgtm_time.tm_mon = tm_time.tm_mon + 1;
++	pgtm_time.tm_year = tm_time.tm_year + 1900;
++
++	if (tm2timestamp(&pgtm_time, 0, NULL, &ts))
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("failed to convert tm to timestamp")));
++
++	PG_RETURN_TIMESTAMP(ts);
++}
++
++
+ /*
+  * Returns specified field of client certificate distinguished name
+  *
+@@ -482,3 +517,35 @@ ssl_extension_info(PG_FUNCTION_ARGS)
+ 	/* All done */
+ 	SRF_RETURN_DONE(funcctx);
+ }
++
++/*
++ * Returns current client certificate notBefore timestamp in
++ * timestamp data type
++ */
++PG_FUNCTION_INFO_V1(ssl_client_get_notbefore);
++Datum
++ssl_client_get_notbefore(PG_FUNCTION_ARGS)
++{
++	X509	   *cert = MyProcPort->peer;
++
++	if (!MyProcPort->ssl_in_use || !MyProcPort->peer_cert_valid)
++		PG_RETURN_NULL();
++
++	return ASN1_TIME_to_timestamp(X509_get_notBefore(cert));
++}
++
++/*
++ * Returns current client certificate notAfter timestamp in
++ * timestamp data type
++ */
++PG_FUNCTION_INFO_V1(ssl_client_get_notafter);
++Datum
++ssl_client_get_notafter(PG_FUNCTION_ARGS)
++{
++	X509	   *cert = MyProcPort->peer;
++
++	if (!MyProcPort->ssl_in_use || !MyProcPort->peer_cert_valid)
++		PG_RETURN_NULL();
++
++	return ASN1_TIME_to_timestamp(X509_get_notAfter(cert));
++}
+diff --git a/contrib/sslinfo/sslinfo.control b/contrib/sslinfo/sslinfo.control
+index c7754f924c..b53e95b7da 100644
+--- a/contrib/sslinfo/sslinfo.control
++++ b/contrib/sslinfo/sslinfo.control
+@@ -1,5 +1,5 @@
+ # sslinfo extension
+ comment = 'information about SSL certificates'
+-default_version = '1.2'
++default_version = '1.3'
+ module_pathname = '$libdir/sslinfo'
+ relocatable = true
 diff --git a/doc/src/sgml/monitoring.sgml b/doc/src/sgml/monitoring.sgml
-index 5cfdc70c03..a13cec0e98 100644
+index 588b720f57..42c7808f50 100644
 --- a/doc/src/sgml/monitoring.sgml
 +++ b/doc/src/sgml/monitoring.sgml
-@@ -3506,6 +3506,26 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
+@@ -2257,6 +2257,26 @@ SELECT pid, wait_event_type, wait_event FROM pg_stat_activity WHERE wait_event i
         This field is truncated like <structfield>client_dn</structfield>.
        </para></entry>
       </row>
 +
 +     <row>
 +      <entry role="catalog_table_entry"><para role="column_definition">
-+       <structfield>not_befoer</structfield> <type>text</type>
++       <structfield>not_before</structfield> <type>text</type>
 +      </para>
 +      <para>
-+       Not before timestamp of the client certificate expressed in ISO 8601
-+       format of YYYY-MM-DDThh:mm:ssZ
++       Not before UTC timestamp of the client certificate, or NULL if no client
++       certificate was supplied.
 +      </para></entry>
 +     </row>
 +
@@ -22,15 +204,56 @@ index 5cfdc70c03..a13cec0e98 100644
 +       <structfield>not_after</structfield> <type>text</type>
 +      </para>
 +      <para>
-+       Not after timestamp of the client certificate expressed in ISO 8601
-+       format of YYYY-MM-DDThh:mm:ssZ
++       Not after UTC timestamp of the client certificate, or NULL if no client
++       certificate was supplied.
 +      </para></entry>
 +     </row>
      </tbody>
     </tgroup>
    </table>
+diff --git a/doc/src/sgml/sslinfo.sgml b/doc/src/sgml/sslinfo.sgml
+index 85d49f6653..06f5728096 100644
+--- a/doc/src/sgml/sslinfo.sgml
++++ b/doc/src/sgml/sslinfo.sgml
+@@ -240,6 +240,36 @@ emailAddress
+     </para>
+     </listitem>
+    </varlistentry>
++
++   <varlistentry>
++    <term>
++     <function>ssl_client_get_notbefore() returns text</function>
++     <indexterm>
++      <primary>ssl_client_get_notbefore</primary>
++     </indexterm>
++    </term>
++    <listitem>
++    <para>
++     Return the <structfield>not before</structfield> UTC timestamp of the client
++     certificate.
++    </para>
++    </listitem>
++   </varlistentry>
++
++   <varlistentry>
++    <term>
++     <function>ssl_client_get_notafter() returns text</function>
++     <indexterm>
++      <primary>ssl_client_get_notafter</primary>
++     </indexterm>
++    </term>
++    <listitem>
++    <para>
++     Return the <structfield>not after</structfield> UTC timestamp of the client
++     certificate.
++    </para>
++    </listitem>
++   </varlistentry>
+   </variablelist>
+  </sect2>
+ 
 diff --git a/src/backend/catalog/system_views.sql b/src/backend/catalog/system_views.sql
-index c18fea8362..104420c2df 100644
+index af65af6bdd..f7c2cfb8cd 100644
 --- a/src/backend/catalog/system_views.sql
 +++ b/src/backend/catalog/system_views.sql
 @@ -970,7 +970,9 @@ CREATE VIEW pg_stat_ssl AS
@@ -45,85 +268,99 @@ index c18fea8362..104420c2df 100644
      WHERE S.client_port IS NOT NULL;
  
 diff --git a/src/backend/libpq/be-secure-openssl.c b/src/backend/libpq/be-secure-openssl.c
-index 658b09988d..e31bbeab23 100644
+index 658b09988d..4babb3d05f 100644
 --- a/src/backend/libpq/be-secure-openssl.c
 +++ b/src/backend/libpq/be-secure-openssl.c
-@@ -72,6 +72,7 @@ static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
+@@ -36,6 +36,7 @@
+ #include "tcop/tcopprot.h"
+ #include "utils/builtins.h"
+ #include "utils/memutils.h"
++#include "utils/timestamp.h"
+ 
+ /*
+  * These SSL-related #includes must come after all system-provided headers.
+@@ -72,6 +73,7 @@ static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
  static const char *SSLerrmessage(unsigned long ecode);
  
  static char *X509_NAME_to_cstring(X509_NAME *name);
-+static char *ASN1_TIME_to_cstring(ASN1_TIME *time);
++static Timestamp ASN1_TIME_to_timestamp(ASN1_TIME *time);
  
  static SSL_CTX *SSL_context = NULL;
  static bool SSL_initialized = false;
-@@ -1406,6 +1407,24 @@ be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len)
+@@ -1406,6 +1408,24 @@ be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len)
  		ptr[0] = '\0';
  }
  
 +void
-+be_tls_get_peer_not_before(Port *port, char *ptr, size_t len)
++be_tls_get_peer_not_before(Port *port, Timestamp *ptr)
 +{
 +	if (port->peer)
-+		strlcpy(ptr, ASN1_TIME_to_cstring(X509_getm_notBefore(port->peer)), len);
++		*ptr = ASN1_TIME_to_timestamp(X509_get_notBefore(port->peer));
 +	else
-+		ptr[0] = '\0';
++		*ptr = 0;
 +}
 +
 +void
-+be_tls_get_peer_not_after(Port *port, char *ptr, size_t len)
++be_tls_get_peer_not_after(Port *port, Timestamp *ptr)
 +{
 +	if (port->peer)
-+		strlcpy(ptr, ASN1_TIME_to_cstring(X509_getm_notAfter(port->peer)), len);
++		*ptr = ASN1_TIME_to_timestamp(X509_get_notAfter(port->peer));
 +	else
-+		ptr[0] = '\0';
++		*ptr = 0;
 +}
 +
  void
  be_tls_get_peer_serial(Port *port, char *ptr, size_t len)
  {
-@@ -1549,6 +1568,27 @@ X509_NAME_to_cstring(X509_NAME *name)
+@@ -1549,6 +1569,33 @@ X509_NAME_to_cstring(X509_NAME *name)
  	return result;
  }
  
 +/*
 + * Convert an ASN1_TIME to a cstring in format of YYYY-MM-DDThh:mm:ssZ.
 + */
-+static char *
-+ASN1_TIME_to_cstring(ASN1_TIME * time)
++static Timestamp
++ASN1_TIME_to_timestamp(ASN1_TIME * time)
 +{
-+	struct tm 	tm_time;
-+	char		str_time[NAMEDATALEN];
-+	char	   	*result;
++	struct tm	tm_time;
++	struct pg_tm pgtm_time;
++	Timestamp	ts;
 +
 +	ASN1_TIME_to_tm(time, &tm_time);
 +
-+	memset(str_time, 0, sizeof(str_time));
-+	snprintf(str_time, sizeof(str_time), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-+			tm_time.tm_year+1900, tm_time.tm_mon+1, tm_time.tm_mday,
-+			tm_time.tm_hour, tm_time.tm_min, tm_time.tm_sec);
++	pgtm_time.tm_sec = tm_time.tm_sec;
++	pgtm_time.tm_min = tm_time.tm_min;
++	pgtm_time.tm_hour = tm_time.tm_hour;
++	pgtm_time.tm_mday = tm_time.tm_mday;
++	pgtm_time.tm_mon = tm_time.tm_mon + 1;
++	pgtm_time.tm_year = tm_time.tm_year + 1900;
 +
-+	result = pstrdup(str_time);
-+	return result;
++	if (tm2timestamp(&pgtm_time, 0, NULL, &ts))
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++				 errmsg("timestamp out of range")));
++
++	return ts;
 +}
 +
  /*
   * Convert TLS protocol version GUC enum to OpenSSL values
   *
 diff --git a/src/backend/utils/activity/backend_status.c b/src/backend/utils/activity/backend_status.c
-index 38f91a495b..a9e6f21501 100644
+index 38f91a495b..02dc9d7931 100644
 --- a/src/backend/utils/activity/backend_status.c
 +++ b/src/backend/utils/activity/backend_status.c
 @@ -367,6 +367,8 @@ pgstat_bestart(void)
  		be_tls_get_peer_subject_name(MyProcPort, lsslstatus.ssl_client_dn, NAMEDATALEN);
  		be_tls_get_peer_serial(MyProcPort, lsslstatus.ssl_client_serial, NAMEDATALEN);
  		be_tls_get_peer_issuer_name(MyProcPort, lsslstatus.ssl_issuer_dn, NAMEDATALEN);
-+		be_tls_get_peer_not_before(MyProcPort, lsslstatus.ssl_not_before, NAMEDATALEN);
-+		be_tls_get_peer_not_after(MyProcPort, lsslstatus.ssl_not_after, NAMEDATALEN);
++		be_tls_get_peer_not_before(MyProcPort, &lsslstatus.ssl_not_before);
++		be_tls_get_peer_not_after(MyProcPort, &lsslstatus.ssl_not_after);
  	}
  	else
  	{
 diff --git a/src/backend/utils/adt/pgstatfuncs.c b/src/backend/utils/adt/pgstatfuncs.c
-index 2a4c8ef87f..c90256e851 100644
+index 2a4c8ef87f..9071981f98 100644
 --- a/src/backend/utils/adt/pgstatfuncs.c
 +++ b/src/backend/utils/adt/pgstatfuncs.c
 @@ -303,7 +303,7 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
@@ -171,13 +408,13 @@ index 2a4c8ef87f..c90256e851 100644
  				else
  					nulls[24] = true;
 +
-+				if (beentry->st_sslstatus->ssl_not_before[0])
-+					values[25] = CStringGetTextDatum(beentry->st_sslstatus->ssl_not_before);
++				if (beentry->st_sslstatus->ssl_not_before != 0)
++					values[25] = TimestampGetDatum(beentry->st_sslstatus->ssl_not_before);
 +				else
 +					nulls[25] = true;
 +
-+				if (beentry->st_sslstatus->ssl_not_after[0])
-+					values[26] = CStringGetTextDatum(beentry->st_sslstatus->ssl_not_after);
++				if (beentry->st_sslstatus->ssl_not_after != 0)
++					values[26] = TimestampGetDatum(beentry->st_sslstatus->ssl_not_after);
 +				else
 +					nulls[26] = true;
  			}
@@ -233,7 +470,7 @@ index 2a4c8ef87f..c90256e851 100644
  
  		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
-index 6996073989..7e71d80a48 100644
+index 6996073989..878c997e87 100644
 --- a/src/include/catalog/pg_proc.dat
 +++ b/src/include/catalog/pg_proc.dat
 @@ -5413,9 +5413,9 @@
@@ -243,40 +480,40 @@ index 6996073989..7e71d80a48 100644
 -  proallargtypes => '{int4,oid,int4,oid,text,text,text,text,text,timestamptz,timestamptz,timestamptz,timestamptz,inet,text,int4,xid,xid,text,bool,text,text,int4,text,numeric,text,bool,text,bool,bool,int4,int8}',
 -  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
 -  proargnames => '{pid,datid,pid,usesysid,application_name,state,query,wait_event_type,wait_event,xact_start,query_start,backend_start,state_change,client_addr,client_hostname,client_port,backend_xid,backend_xmin,backend_type,ssl,sslversion,sslcipher,sslbits,ssl_client_dn,ssl_client_serial,ssl_issuer_dn,gss_auth,gss_princ,gss_enc,gss_delegation,leader_pid,query_id}',
-+  proallargtypes => '{int4,oid,int4,oid,text,text,text,text,text,timestamptz,timestamptz,timestamptz,timestamptz,inet,text,int4,xid,xid,text,bool,text,text,int4,text,numeric,text,text,text,bool,text,bool,bool,int4,int8}',
++  proallargtypes => '{int4,oid,int4,oid,text,text,text,text,text,timestamptz,timestamptz,timestamptz,timestamptz,inet,text,int4,xid,xid,text,bool,text,text,int4,text,numeric,text,timestamp,timestamp,bool,text,bool,bool,int4,int8}',
 +  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
 +  proargnames => '{pid,datid,pid,usesysid,application_name,state,query,wait_event_type,wait_event,xact_start,query_start,backend_start,state_change,client_addr,client_hostname,client_port,backend_xid,backend_xmin,backend_type,ssl,sslversion,sslcipher,sslbits,ssl_client_dn,ssl_client_serial,ssl_issuer_dn,ssl_not_before,ssl_not_after,gss_auth,gss_princ,gss_enc,gss_delegation,leader_pid,query_id}',
    prosrc => 'pg_stat_get_activity' },
  { oid => '3318',
    descr => 'statistics: information about progress of backends running maintenance command',
 diff --git a/src/include/libpq/libpq-be.h b/src/include/libpq/libpq-be.h
-index a0b74c8095..d94fb46927 100644
+index a0b74c8095..02765ba9d9 100644
 --- a/src/include/libpq/libpq-be.h
 +++ b/src/include/libpq/libpq-be.h
 @@ -298,6 +298,8 @@ extern const char *be_tls_get_cipher(Port *port);
  extern void be_tls_get_peer_subject_name(Port *port, char *ptr, size_t len);
  extern void be_tls_get_peer_issuer_name(Port *port, char *ptr, size_t len);
  extern void be_tls_get_peer_serial(Port *port, char *ptr, size_t len);
-+extern void be_tls_get_peer_not_before(Port *port, char *ptr, size_t len);
-+extern void be_tls_get_peer_not_after(Port *port, char *ptr, size_t len);
++extern void be_tls_get_peer_not_before(Port *port, Timestamp *ptr);
++extern void be_tls_get_peer_not_after(Port *port, Timestamp *ptr);
  
  /*
   * Get the server certificate hash for SCRAM channel binding type
 diff --git a/src/include/utils/backend_status.h b/src/include/utils/backend_status.h
-index 77939a0aed..f9277454e4 100644
+index 77939a0aed..1e4fedb661 100644
 --- a/src/include/utils/backend_status.h
 +++ b/src/include/utils/backend_status.h
 @@ -61,6 +61,8 @@ typedef struct PgBackendSSLStatus
  	char		ssl_client_serial[NAMEDATALEN];
  
  	char		ssl_issuer_dn[NAMEDATALEN];
-+	char		ssl_not_before[NAMEDATALEN];
-+	char		ssl_not_after[NAMEDATALEN];
++	Timestamp	ssl_not_before;
++	Timestamp	ssl_not_after;
  } PgBackendSSLStatus;
  
  /*
 diff --git a/src/test/regress/expected/rules.out b/src/test/regress/expected/rules.out
-index 7fd81e6a7d..231c01113a 100644
+index e07afcd4aa..30108846c1 100644
 --- a/src/test/regress/expected/rules.out
 +++ b/src/test/regress/expected/rules.out
 @@ -1760,7 +1760,7 @@ pg_stat_activity| SELECT s.datid,
@@ -297,7 +534,7 @@ index 7fd81e6a7d..231c01113a 100644
    WHERE (client_port IS NOT NULL);
  pg_stat_io| SELECT backend_type,
      object,
-@@ -2078,7 +2078,7 @@ pg_stat_replication| SELECT s.pid,
+@@ -2080,7 +2080,7 @@ pg_stat_replication| SELECT s.pid,
      w.sync_priority,
      w.sync_state,
      w.reply_time
@@ -306,7 +543,7 @@ index 7fd81e6a7d..231c01113a 100644
       JOIN pg_stat_get_wal_senders() w(pid, state, sent_lsn, write_lsn, flush_lsn, replay_lsn, write_lag, flush_lag, replay_lag, sync_priority, sync_state, reply_time) ON ((s.pid = w.pid)))
       LEFT JOIN pg_authid u ON ((s.usesysid = u.oid)));
  pg_stat_replication_slots| SELECT s.slot_name,
-@@ -2111,8 +2111,10 @@ pg_stat_ssl| SELECT pid,
+@@ -2113,8 +2113,10 @@ pg_stat_ssl| SELECT pid,
      sslbits AS bits,
      ssl_client_dn AS client_dn,
      ssl_client_serial AS client_serial,
@@ -320,7 +557,7 @@ index 7fd81e6a7d..231c01113a 100644
  pg_stat_subscription| SELECT su.oid AS subid,
      su.subname,
 diff --git a/src/test/ssl/t/001_ssltests.pl b/src/test/ssl/t/001_ssltests.pl
-index 76442de063..e9db6fd060 100644
+index 76442de063..bad41cacc8 100644
 --- a/src/test/ssl/t/001_ssltests.pl
 +++ b/src/test/ssl/t/001_ssltests.pl
 @@ -543,8 +543,8 @@ command_like(
@@ -341,7 +578,35 @@ index 76442de063..e9db6fd060 100644
 -	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn\r?\n
 -				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,/?CN=ssltestuser,$serialno,/?\QCN=Test CA for PostgreSQL SSL regression test client certs\E\r?$}mx,
 +	qr{^pid,ssl,version,cipher,bits,client_dn,client_serial,issuer_dn,not_before,not_after\r?\n
-+				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,/?CN=ssltestuser,$serialno,/?\QCN=Test CA for PostgreSQL SSL regression test client certs\E,2021-03-03T22:12:07Z,2048-07-19T22:12:07Z\r?$}mx,
++				^\d+,t,TLSv[\d.]+,[\w-]+,\d+,/?CN=ssltestuser,$serialno,/?\QCN=Test CA for PostgreSQL SSL regression test client certs\E,\Q2023-06-29 01:01:01\E,\Q2050-01-01 01:01:01\E\r?$}mx,
  	'pg_stat_ssl with client certificate');
  
  # client key with wrong permissions
+diff --git a/src/test/ssl/t/003_sslinfo.pl b/src/test/ssl/t/003_sslinfo.pl
+index 5306aad802..f050a6f4f9 100644
+--- a/src/test/ssl/t/003_sslinfo.pl
++++ b/src/test/ssl/t/003_sslinfo.pl
+@@ -165,6 +165,20 @@ $result = $node->safe_psql(
+ 	connstr => $common_connstr);
+ is($result, 't', "ssl_issuer_field() for commonName");
+ 
++$result = $node->safe_psql(
++	"certdb",
++	"SELECT ssl_client_get_notbefore() = not_before, "
++	  . "not_before = '2023-06-29 01:01:01' FROM pg_stat_ssl WHERE pid = pg_backend_pid();",
++	connstr => $common_connstr);
++is($result, 't|t', "ssl_client_get_notbefore() for not_before timestamp");
++
++$result = $node->safe_psql(
++	"certdb",
++	"SELECT ssl_client_get_notafter() = not_after, "
++	  . "not_after = '2050-01-01 01:01:01' FROM pg_stat_ssl WHERE pid = pg_backend_pid();",
++	connstr => $common_connstr);
++is($result, 't|t', "ssl_client_get_notafter() for not_after timestamp");
++
+ $result = $node->safe_psql(
+ 	"certdb",
+ 	"SELECT value, critical FROM ssl_extension_info() WHERE name = 'basicConstraints';",
+-- 
+2.32.1 (Apple Git-133)
+
