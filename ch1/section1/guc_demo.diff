@@ -1,0 +1,58 @@
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 691b9622da..7c19705341 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -108,6 +108,8 @@
+ 
+ extern uint32 bootstrap_data_checksum_version;
+ 
++bool guc_demo = false;
++
+ /* timeline ID to be used when bootstrapping */
+ #define BootstrapTimeLineID		1
+ 
+@@ -4910,6 +4912,10 @@ StartupXLOG(void)
+ 		   CurrentResourceOwner == AuxProcessResourceOwner);
+ 	CurrentResourceOwner = AuxProcessResourceOwner;
+ 
++	if (guc_demo)
++		ereport(LOG, (errmsg("hello, guc demo enabled")));
++	else
++		ereport(LOG, (errmsg("hello, guc demo disabled")));
+ 	/*
+ 	 * Check that contents look valid.
+ 	 */
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index e9084f4506..095521a919 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -1022,6 +1022,16 @@ static struct config_bool ConfigureNamesBool[] =
+ 		true,
+ 		NULL, NULL, NULL
+ 	},
++	{
++		{"guc_demo", PGC_SUSET, DEVELOPER_OPTIONS,
++			gettext_noop("GUC demo."),
++			NULL,
++			GUC_NOT_IN_SAMPLE
++		},
++		&guc_demo,
++		false,
++		NULL, NULL, NULL
++	},
+ 	{
+ 		{"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
+ 			gettext_noop("Enables the planner's use of index-scan plans."),
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index cd674c3c23..20ed535380 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -18,6 +18,8 @@
+ #include "nodes/pg_list.h"
+ 
+ 
++extern bool guc_demo;
++
+ /* Sync methods */
+ #define SYNC_METHOD_FSYNC		0
+ #define SYNC_METHOD_FDATASYNC	1
