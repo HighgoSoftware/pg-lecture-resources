@@ -1,0 +1,484 @@
+From 6a4dc17fc388f5ee94435bd1227f28f2107e56b9 Mon Sep 17 00:00:00 2001
+From: David Zhang <idrawone@gmail.com>
+Date: Wed, 1 Nov 2023 13:33:00 -0700
+Subject: [PATCH] to restore a specific table using oid
+
+---
+ data.c    |  77 ++++++++++++++++++++++
+ pg_rman.c |  37 +++++++++++
+ pg_rman.h |   4 ++
+ restore.c | 193 ++++++++++++++++++++++++++++++++++++++++++++----------
+ 4 files changed, 278 insertions(+), 33 deletions(-)
+
+diff --git a/data.c b/data.c
+index 6ee2ffd..e810178 100644
+--- a/data.c
++++ b/data.c
+@@ -24,6 +24,9 @@
+ #include "storage/checksum_impl.h"
+ #include "idxpagehdr.h"
+ 
++static char *str_replace(char *orig, char *rep, char *with);
++
++
+ #ifdef HAVE_LIBZ
+ #include <zlib.h>
+ 
+@@ -869,6 +872,27 @@ restore_data_file(const char *from_root,
+ 
+ 	fclose(in);
+ 	fclose(out);
++
++	if (target_table_oid != NULL && target_table_oid_new != NULL)
++	{
++		if (is_targeted_table_oid(to_path, '/', target_table_oid))
++		{
++			char *new = str_replace(to_path, target_table_oid, target_table_oid_new);
++
++			if (new)
++			{
++				elog(INFO, ">>>>>>>>>> targeted table restore: rename [%s], len=%ld.", new, strlen(new));
++				if (rename(to_path, new) != 0)
++				{
++					ereport(ERROR,
++						(errcode(ERROR_SYSTEM),
++						 errmsg(">>>>>>>>>> targeted table restore: could not rename targeted table oid file \"%s\" to \"%s\": %s",
++						to_path, new, strerror(errno))));
++				}
++				free(new);
++			}
++		}
++	}
+ }
+ 
+ bool
+@@ -1304,3 +1328,56 @@ get_standby_signal_filepath(char *path, size_t size)
+ 	make_native_path(path);
+ 	return fileExists(path);
+ }
++
++/*
++ * must free the result if result is non-NULL.
++ */
++char *str_replace(char *orig, char *rep, char *with)
++{
++    char *result; // the return string
++    char *ins;    // the next insert point
++    char *tmp;    // varies
++    int len_rep;  // length of rep (the string to remove)
++    int len_with; // length of with (the string to replace rep with)
++    int len_front; // distance between rep and end of last rep
++    int count;    // number of replacements
++
++    // sanity checks and initialization
++    if (!orig || !rep)
++        return NULL;
++    len_rep = strlen(rep);
++    if (len_rep == 0)
++        return NULL; // empty rep causes infinite loop during count
++    if (!with)
++        with = "";
++    len_with = strlen(with);
++
++    // count the number of replacements needed
++    ins = orig;
++    for (count = 0; tmp = strstr(ins, rep); ++count)
++    {
++        ins = tmp + len_rep;
++    }
++
++    tmp = result = malloc(strlen(orig) + (len_with - len_rep) * count + 1);
++
++    if (!result)
++        return NULL;
++
++    // first time through the loop, all the variable are set correctly
++    // from here on,
++    //    tmp points to the end of the result string
++    //    ins points to the next occurrence of rep in orig
++    //    orig points to the remainder of orig after "end of rep"
++    while (count--)
++    {
++        ins = strstr(orig, rep);
++        len_front = ins - orig;
++        tmp = strncpy(tmp, orig, len_front) + len_front;
++        tmp = strcpy(tmp, with) + len_with;
++        orig += len_front + len_rep; // move to next "end of rep"
++    }
++    strcpy(tmp, orig);
++    return result;
++}
++
+diff --git a/pg_rman.c b/pg_rman.c
+index fa7b601..82a13c4 100644
+--- a/pg_rman.c
++++ b/pg_rman.c
+@@ -24,11 +24,14 @@ char *pgdata;
+ char *arclog_path;
+ char *srvlog_path;
+ char *pgconf_path;
++char *target_table_oid;
++char *target_table_oid_new;
+ 
+ /* common configuration */
+ bool verbose = false;
+ bool progress = false;
+ bool check = false;
++bool online_restore = false;
+ 
+ /* directory configuration */
+ pgBackup	current;
+@@ -97,6 +100,9 @@ static pgut_option options[] =
+ 	{ 's', 10, "recovery-target-timeline"	, &target_tli_string, SOURCE_ENV },
+ 	{ 's', 11, "recovery-target-action"		, &target_action	, SOURCE_ENV },
+ 	{ 'b', 12, "hard-copy"	, &is_hard_copy		, SOURCE_ENV },
++	{ 's', 15, "target-table-oid"			, &target_table_oid	, SOURCE_ENV },
++	{ 's', 16, "target-table-oid-new"		, &target_table_oid_new		, SOURCE_ENV },
++	{ 'b', 17, "online-restore"			, &online_restore },
+ 	/* catalog options */
+ 	{ 'b', 'a', "show-all"		, &show_all },
+ 	{ 0 }
+@@ -228,8 +234,36 @@ main(int argc, char *argv[])
+ 		return do_backup(bkupopt);
+ 	}
+ 	else if (pg_strcasecmp(cmd, "restore") == 0)
++	{
++		if (target_table_oid != NULL)
++		{
++			if (strlen(target_table_oid) != strspn(target_table_oid, "0123456789"))
++				ereport(ERROR,
++					(errcode(ERROR_ARGS),
++					errmsg("--target-table-oid must be numbers only")));
++
++			if (atol(target_table_oid) < 16384 || atol(target_table_oid) > UINT_MAX)
++				ereport(ERROR,
++					(errcode(ERROR_ARGS),
++					errmsg("--target-table-oid must be in [16384, 4294967295]")));
++		}
++
++		if (target_table_oid_new != NULL)
++		{
++			if (strlen(target_table_oid_new) != strspn(target_table_oid_new, "0123456789"))
++				ereport(ERROR,
++					(errcode(ERROR_ARGS),
++					errmsg("--target-table-oid-new must be numbers only")));
++
++			if (atol(target_table_oid_new) < 16384 || atol(target_table_oid_new) > UINT_MAX)
++				ereport(ERROR,
++					(errcode(ERROR_ARGS),
++					errmsg("--target-table-oid-new must be in [16384, 4294967295]")));
++		}
++
+ 		return do_restore(target_time, target_xid,
+ 					target_inclusive, target_tli_string, target_action, is_hard_copy);
++	}
+ 	else if (pg_strcasecmp(cmd, "show") == 0)
+ 		return do_show(&range, show_detail, show_all);
+ 	else if (pg_strcasecmp(cmd, "validate") == 0)
+@@ -296,6 +330,9 @@ pgut_help(bool details)
+ 	printf(_("  --recovery-target-timeline  recovering into a particular timeline\n"));
+ 	printf(_("  --recovery-target-action    action the server should take once the recovery target is reached\n"));
+ 	printf(_("  --hard-copy                 copying archivelog not symbolic link\n"));
++	printf(_("  ---target-table-oid         restore the targeted table only\n"));
++	printf(_("  ---target-table-oid-new     restore the targeted table to the new targeted table only\n"));
++	printf(_("  ---online-restore           restore the targeted table without stopping PostgreSQL server!!!\n"));
+ 	printf(_("\nCatalog options:\n"));
+ 	printf(_("  -a, --show-all            show deleted backup too\n"));
+ 	printf(_("\nDelete options:\n"));
+diff --git a/pg_rman.h b/pg_rman.h
+index 2bc24d6..1846a78 100644
+--- a/pg_rman.h
++++ b/pg_rman.h
+@@ -242,11 +242,14 @@ extern char *pgdata;
+ extern char *arclog_path;
+ extern char *srvlog_path;
+ extern char *pgconf_path;
++extern char *target_table_oid;
++extern char *target_table_oid_new;
+ 
+ /* common configuration */
+ extern bool verbose;
+ extern bool progress;
+ extern bool check;
++extern bool online_restore;
+ 
+ /* current settings */
+ extern pgBackup current;
+@@ -268,6 +271,7 @@ extern int do_restore(const char *target_time,
+ 					  const char *target_tli_string,
+ 					  const char *target_action,
+ 					  bool is_hard_copy);
++extern int is_targeted_table_oid(const char *str, const char c, const char *target);
+ 
+ /* in init.c */
+ extern int do_init(void);
+diff --git a/restore.c b/restore.c
+index 58a4580..1ba63c0 100644
+--- a/restore.c
++++ b/restore.c
+@@ -60,6 +60,8 @@ static TimeLineID findNewestTimeLine(TimeLineID startTLI);
+ static bool existsTimeLineHistory(TimeLineID probeTLI);
+ static void print_backup_id(const pgBackup *backup);
+ static void search_next_wal(const char *path, uint32 *needId, uint32 *needSeg, parray *timelines);
++static int last_occurence(const char *str, char c);
++int is_targeted_table_oid(const char *str, const char c, const char *target);
+ 
+ static int wal_segment_size = 0;
+ 
+@@ -130,11 +132,18 @@ do_restore(const char *target_time,
+ 			 errdetail("Another pg_rman is just running.")));
+ 
+ 	/* confirm the PostgreSQL server is not running */
+-	if (is_pg_running())
+-		ereport(ERROR,
+-			(errcode(ERROR_PG_RUNNING),
+-			 errmsg("PostgreSQL server is running"),
+-			 errhint("Please stop PostgreSQL server before executing restore.")));
++	if (online_restore && (target_table_oid != NULL || target_table_oid_new != NULL))
++	{
++		elog(INFO, ">>>>>>>>>> online restore for targeted table, no need to stop PostgreSQL server.");
++	}
++	else
++	{
++		if (is_pg_running())
++			ereport(ERROR,
++				(errcode(ERROR_PG_RUNNING),
++				 errmsg("PostgreSQL server is running"),
++				 errhint("Please stop PostgreSQL server before executing restore.")));
++	}
+ 
+ 	rt = checkIfCreateRecoveryConf(target_time, target_xid, target_inclusive, target_action);
+ 	if(rt == NULL)
+@@ -283,7 +292,18 @@ base_backup_found:
+ 		for (i = 0; i < parray_num(files); i++)
+ 		{
+ 			pgFile *file = (pgFile *) parray_get(files, i);
+-			pgFileDelete(file);
++			if (target_table_oid != NULL)
++			{
++				if (is_targeted_table_oid(file->path, '/', target_table_oid))
++				{
++					pgFileDelete(file);
++					elog(INFO, ">>>>>>>>>> targeted table restore: delete oid file [%s].", file->path);
++				}
++			}
++			else
++			{
++				pgFileDelete(file);
++			}
+ 		}
+ 		parray_walk(files, pgFileFree);
+ 		parray_free(files);
+@@ -374,7 +394,14 @@ base_backup_found:
+ 	}
+ 
+ 	/* copy online WAL backup to $PGDATA/pg_wal */
+-	restore_online_files();
++	if (target_table_oid != NULL)
++	{
++		elog(INFO, ">>>>>>>>>> targeted table restore: skip online backup");
++	}
++	else
++	{
++		restore_online_files();
++	}
+ 
+ 	if (check)
+ 	{
+@@ -411,10 +438,20 @@ base_backup_found:
+ 		printf(_("all restore completed\n"));
+ 		printf(_("========================================\n"));
+ 	}
+-	if (!check)
+-		ereport(INFO,
+-			(errmsg("restore complete"),
+-			 errhint("Recovery will start automatically when the PostgreSQL server is started. After the recovery is done, we recommend to remove recovery-related parameters configured by pg_rman.")));
++	if (target_table_oid != NULL)
++	{
++		if (!check)
++			ereport(INFO,
++				(errmsg("restore complete"),
++				 errhint(">>>>>>>>>> Targeted table [%s] restore is done, we recommend to run a full backup now.", target_table_oid)));
++	}
++	else
++	{
++		if (!check)
++			ereport(INFO,
++				(errmsg("restore complete"),
++				 errhint("Recovery will start automatically when the PostgreSQL server is started. After the recovery is done, we recommend to remove recovery-related parameters configured by pg_rman.")));
++	}
+ 
+ 	return 0;
+ }	
+@@ -534,12 +571,32 @@ restore_database(pgBackup *backup)
+ 				file->path + strlen(from_root) + 1);
+ 
+ 		/* directories are created with mkdirs.sh */
+-		if (S_ISDIR(file->mode))
++		if (target_table_oid != NULL)
+ 		{
+-			num_skipped++;
+-			if (verbose && !check)
+-				printf(_("directory, skip\n"));
+-			goto show_progress;
++			if (is_targeted_table_oid(file->path + strlen(from_root) + 1, '/', target_table_oid))
++			{
++				elog(INFO, ">>>>>>>>>> targeted table restore: found [%s].",
++						file->path + strlen(from_root) + 1);
++			}
++
++			if (S_ISDIR(file->mode) ||
++					!is_targeted_table_oid(file->path + strlen(from_root) + 1, '/', target_table_oid))
++			{
++				num_skipped++;
++				if (verbose && !check)
++					printf(_("directory, skip\n"));
++				goto show_progress;
++			}
++		}
++		else
++		{
++			if (S_ISDIR(file->mode))
++			{
++				num_skipped++;
++				if (verbose && !check)
++					printf(_("directory, skip\n"));
++				goto show_progress;
++			}
+ 		}
+ 
+ 		/* not backed up */
+@@ -600,9 +657,22 @@ show_progress:
+ 			/* If the file is not in the file list, delete it */
+ 			if (parray_bsearch(files, file, pgFileComparePathDesc) == NULL)
+ 			{
+-				if (verbose)
+-					printf(_("  delete %s\n"), file->path + strlen(pgdata) + 1);
+-				pgFileDelete(file);
++				if (target_table_oid_new != NULL && is_targeted_table_oid(file->path, '/', target_table_oid_new))
++				{
++					if (verbose)
++						printf(_("  delete %s skipped.\n"), file->path + strlen(pgdata) + 1);
++					continue;
++				}
++				else if(online_restore)
++				{
++					continue;
++				}
++				else
++				{
++					if (verbose)
++						printf(_("  delete %s\n"), file->path + strlen(pgdata) + 1);
++					pgFileDelete(file);
++				}
+ 			}
+ 		}
+ 
+@@ -610,12 +680,19 @@ show_progress:
+ 		parray_free(files_now);
+ 	}
+ 
+-	/* remove postmaster.pid */
+-	snprintf(path, lengthof(path), "%s/postmaster.pid", pgdata);
+-	if (remove(path) == -1 && errno != ENOENT)
+-		ereport(ERROR,
+-			(errcode(ERROR_SYSTEM),
+-			 errmsg("could not remove postmaster.pid: %s", strerror(errno))));
++	if (!online_restore)
++	{
++		/* remove postmaster.pid */
++		snprintf(path, lengthof(path), "%s/postmaster.pid", pgdata);
++		if (remove(path) == -1 && errno != ENOENT)
++			ereport(ERROR,
++				(errcode(ERROR_SYSTEM),
++				 errmsg("could not remove postmaster.pid: %s", strerror(errno))));
++	}
++	else
++	{
++		elog(INFO, ">>>>>>>>>> targeted table restore: online-restore, delete postmaster.pid skipped");
++	}
+ 
+ 	/* cleanup */
+ 	parray_walk(files, pgFileFree);
+@@ -796,16 +873,23 @@ configure_recovery_options(const char *target_time,
+ 	 */
+ 	create_recovery_configuration_file(target_time, target_xid, target_inclusive,
+ 								 target_action, target_tli, target_tli_latest);
+-	include_recovery_configuration();
++	if (target_table_oid != NULL)
++	{
++		elog(INFO, ">>>>>>>>>> targeted table restore: skip online recovery");
++	}
++	else
++	{
++		include_recovery_configuration();
+ 
+-	/* Create recovery.signal file */
+-	create_recovery_signal();
++		/* Create recovery.signal file */
++		create_recovery_signal();
+ 
+-	/*
+-	 * Remove if standby.signal file exists because pg_rman doesn’t treat
+-	 * the backup as restoring on standby automatically now.
+-	 */
+-	remove_standby_signal();
++		/*
++		 * Remove if standby.signal file exists because pg_rman doesn’t treat
++		 * the backup as restoring on standby automatically now.
++		 */
++		remove_standby_signal();
++	}
+ }
+ 
+ static void
+@@ -1579,3 +1663,46 @@ existsTimeLineHistory(TimeLineID probeTLI)
+ 
+ 	return false;
+ }
++
++static int last_occurence(const char *str, char c)
++{
++	if (!*str) return -1;
++
++	int n = last_occurence(str + 1, c);
++
++	return n + (n != -1 || *str == c);
++}
++
++int is_targeted_table_oid(const char *str, const char c, const char *target)
++{
++	int pos;
++	char last_str[128];
++	pos = last_occurence(str, c);
++	strncpy(last_str, str + pos + 1, strlen(str) - pos);
++	if (strcmp(last_str, target) == 0)
++	{
++		return 1;
++	}
++	else if(strstr(last_str, target) != NULL)
++	{
++		char tmp_str[128] = {0};
++		if (strstr(last_str, "."))
++		{
++			pos = last_occurence(last_str, '.');
++		}
++//		else if (strstr(last_str, "_"))
++//		{
++//			pos = last_occurence(last_str, '_');
++//		}
++		else
++		{
++			return 0;
++		}
++
++		strncpy(tmp_str, last_str, pos);
++		return (!strcmp(tmp_str, target));
++    }
++
++    return 0;
++}
++
+-- 
+2.34.1
+
