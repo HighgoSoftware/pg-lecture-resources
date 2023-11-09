@@ -1,0 +1,22 @@
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 691b9622da..4c656fd82c 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -6545,7 +6545,7 @@ CreateCheckPoint(int flags)
+ 	}
+ 	pfree(vxids);
+ 
+-	CheckPointGuts(checkPoint.redo, flags);
++	//CheckPointGuts(checkPoint.redo, flags);
+ 
+ 	vxids = GetVirtualXIDsDelayingChkpt(&nvxids, DELAY_CHKPT_COMPLETE);
+ 	if (nvxids > 0)
+@@ -7031,7 +7031,7 @@ CreateRestartPoint(int flags)
+ 	/* Update the process title */
+ 	update_checkpoint_display(flags, true, false);
+ 
+-	CheckPointGuts(lastCheckPoint.redo, flags);
++	//CheckPointGuts(lastCheckPoint.redo, flags);
+ 
+ 	/*
+ 	 * Remember the prior checkpoint's redo ptr for

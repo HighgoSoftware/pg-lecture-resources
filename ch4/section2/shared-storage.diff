@@ -1,0 +1,280 @@
+diff --git a/pgenv b/pgenv
+new file mode 100644
+index 0000000000..0952575496
+--- /dev/null
++++ b/pgenv
+@@ -0,0 +1,4 @@
++PPGPORT=5432
++SPGPORT=5433
++PGDATA=/tmp/pgdata
++PGBIN=/media/david/disk1/pg153/bin
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 691b9622da..e69f1f915a 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -112,6 +112,7 @@ extern uint32 bootstrap_data_checksum_version;
+ #define BootstrapTimeLineID		1
+ 
+ /* User-settable parameters */
++bool 	ss_standby = false;
+ int			max_wal_size_mb = 1024; /* 1 GB */
+ int			min_wal_size_mb = 80;	/* 80 MB */
+ int			wal_keep_size_mb = 0;
+@@ -6852,6 +6853,7 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
+ static void
+ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
+ {
++	if (ss_standby) return;
+ 	CheckPointRelationMap();
+ 	CheckPointReplicationSlots();
+ 	CheckPointSnapBuild();
+diff --git a/src/backend/port/sysv_shmem.c b/src/backend/port/sysv_shmem.c
+index ea287c733d..05c08e09bc 100644
+--- a/src/backend/port/sysv_shmem.c
++++ b/src/backend/port/sysv_shmem.c
+@@ -689,11 +689,26 @@ PGSharedMemoryCreate(Size size,
+ 	 * positively identify shmem segments associated with this data dir, and
+ 	 * also as seeds for searching for a free shmem key.
+ 	 */
+-	if (stat(DataDir, &statbuf) < 0)
+-		ereport(FATAL,
+-				(errcode_for_file_access(),
+-				 errmsg("could not stat data directory \"%s\": %m",
+-						DataDir)));
++	if (ss_standby)
++	{
++		char datadir_tmp[1024];
++		const char *tmp = "pg_wal";
++		strcpy(datadir_tmp, DataDir);
++		strcat(datadir_tmp, "/");
++		strcat(datadir_tmp, tmp);
++
++		if (stat(datadir_tmp, &statbuf) < 0)
++			ereport(FATAL,
++					(errcode_for_file_access(),
++					 errmsg("could not stat data directory \"%s\": %m",
++							DataDir)));
++	}
++	else
++		if (stat(DataDir, &statbuf) < 0)
++			ereport(FATAL,
++					(errcode_for_file_access(),
++					 errmsg("could not stat data directory \"%s\": %m",
++							DataDir)));
+ 
+ 	/* Complain if hugepages demanded but we can't possibly support them */
+ #if !defined(MAP_HUGETLB)
+@@ -767,7 +782,7 @@ PGSharedMemoryCreate(Size size,
+ 			case SHMSTATE_ATTACHED:
+ 				ereport(FATAL,
+ 						(errcode(ERRCODE_LOCK_FILE_EXISTS),
+-						 errmsg("pre-existing shared memory block (key %lu, ID %lu) is still in use",
++						 errmsg("pre-existing shared memory block (key %lu, ID %lu) is still in use1",
+ 								(unsigned long) NextShmemSegID,
+ 								(unsigned long) shmid),
+ 						 errhint("Terminate any old server processes associated with data directory \"%s\".",
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 892d42c63e..4939b494fe 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -1928,12 +1928,12 @@ ServerLoop(void)
+ 		 */
+ 		if (now - last_lockfile_recheck_time >= 1 * SECS_PER_MINUTE)
+ 		{
+-			if (!RecheckDataDirLockFile())
+-			{
+-				ereport(LOG,
+-						(errmsg("performing immediate shutdown because data directory lock file is invalid")));
+-				kill(MyProcPid, SIGQUIT);
+-			}
++			//if (!RecheckDataDirLockFile())
++			//{
++			//	ereport(LOG,
++			//			(errmsg("performing immediate shutdown because data directory lock file is invalid")));
++			//	kill(MyProcPid, SIGQUIT);
++			//}
+ 			last_lockfile_recheck_time = now;
+ 		}
+ 
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index 8d7ef91785..278210dc00 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -2178,6 +2178,7 @@ FileWrite(File file, char *buffer, int amount, off_t offset,
+ 			   (int64) offset,
+ 			   amount, buffer));
+ 
++	if (ss_standby) return amount;
+ 	returnCode = FileAccess(file);
+ 	if (returnCode < 0)
+ 		return returnCode;
+diff --git a/src/backend/utils/init/miscinit.c b/src/backend/utils/init/miscinit.c
+index b25bd0e583..c40b009a0f 100644
+--- a/src/backend/utils/init/miscinit.c
++++ b/src/backend/utils/init/miscinit.c
+@@ -1131,26 +1131,26 @@ CreateLockFile(const char *filename, bool amPostmaster,
+ 		if (other_pid != my_pid && other_pid != my_p_pid &&
+ 			other_pid != my_gp_pid)
+ 		{
+-			if (kill(other_pid, 0) == 0 ||
+-				(errno != ESRCH && errno != EPERM))
+-			{
+-				/* lockfile belongs to a live process */
+-				ereport(FATAL,
+-						(errcode(ERRCODE_LOCK_FILE_EXISTS),
+-						 errmsg("lock file \"%s\" already exists",
+-								filename),
+-						 isDDLock ?
+-						 (encoded_pid < 0 ?
+-						  errhint("Is another postgres (PID %d) running in data directory \"%s\"?",
+-								  (int) other_pid, refName) :
+-						  errhint("Is another postmaster (PID %d) running in data directory \"%s\"?",
+-								  (int) other_pid, refName)) :
+-						 (encoded_pid < 0 ?
+-						  errhint("Is another postgres (PID %d) using socket file \"%s\"?",
+-								  (int) other_pid, refName) :
+-						  errhint("Is another postmaster (PID %d) using socket file \"%s\"?",
+-								  (int) other_pid, refName))));
+-			}
++//			if (kill(other_pid, 0) == 0 ||
++//				(errno != ESRCH && errno != EPERM))
++//			{
++//				/* lockfile belongs to a live process */
++//				ereport(FATAL,
++//						(errcode(ERRCODE_LOCK_FILE_EXISTS),
++//						 errmsg("lock file \"%s\" already exists",
++//								filename),
++//						 isDDLock ?
++//						 (encoded_pid < 0 ?
++//						  errhint("Is another postgres (PID %d) running in data directory \"%s\"?",
++//								  (int) other_pid, refName) :
++//						  errhint("Is another postmaster (PID %d) running in data directory \"%s\"?",
++//								  (int) other_pid, refName)) :
++//						 (encoded_pid < 0 ?
++//						  errhint("Is another postgres (PID %d) using socket file \"%s\"?",
++//								  (int) other_pid, refName) :
++//						  errhint("Is another postmaster (PID %d) using socket file \"%s\"?",
++//								  (int) other_pid, refName))));
++//			}
+ 		}
+ 
+ 		/*
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index e9084f4506..af9e665911 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -2171,6 +2171,15 @@ static struct config_bool ConfigureNamesBool[] =
+ 		false,
+ 		NULL, NULL, NULL
+ 	},
++	/* Initialize mode for sharedsm */
++	{
++		{"ss_standby", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Set the mode for sharedsm, default off."),
++		},
++		&ss_standby,
++		false,
++		NULL, NULL, NULL
++	},	
+ 
+ 	/* End-of-list marker */
+ 	{
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index f92ff4cc29..8fece4de0e 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -811,3 +811,4 @@
+ #------------------------------------------------------------------------------
+ 
+ # Add settings for extensions here
++#ss_standby = false
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index cd674c3c23..1a0c8499a8 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -24,6 +24,7 @@
+ #define SYNC_METHOD_OPEN		2	/* for O_SYNC */
+ #define SYNC_METHOD_FSYNC_WRITETHROUGH	3
+ #define SYNC_METHOD_OPEN_DSYNC	4	/* for O_DSYNC */
++extern PGDLLIMPORT bool ss_standby;
+ extern PGDLLIMPORT int sync_method;
+ 
+ extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
+diff --git a/src/include/utils/guc.h b/src/include/utils/guc.h
+index 65eafb463b..ab66e689ba 100644
+--- a/src/include/utils/guc.h
++++ b/src/include/utils/guc.h
+@@ -145,6 +145,7 @@ typedef struct ConfigVariable
+ 	struct ConfigVariable *next;
+ } ConfigVariable;
+ 
++extern PGDLLIMPORT bool ss_standby;
+ extern bool ParseConfigFile(const char *config_file, bool strict,
+ 							const char *calling_file, int calling_lineno,
+ 							int depth, int elevel,
+diff --git a/ss.sh b/ss.sh
+new file mode 100755
+index 0000000000..b90464a0f9
+--- /dev/null
++++ b/ss.sh
+@@ -0,0 +1,60 @@
++#!/bin/bash
++
++set -x
++### default to initdb
++CMD=${1:-init}
++
++
++### load local environment
++source ./pgenv
++
++### stop postgres and remove logfiles
++killall -9 postgres
++rm -rf /tmp/logfile-*
++
++if [ "$CMD" == "restart" ]; then
++	### start the primary server
++	sed -i "s/^port = $SPGPORT/port = $PPGPORT/g" $PGDATA/postgresql.conf
++	sed -i "s/^ss_standby = 1/ss_standby = 0/g" $PGDATA/postgresql.conf
++
++	$PGBIN/pg_ctl -D $PGDATA -l /tmp/logfile-primary start
++	sleep 3
++	rm -rf $PGDATA/postmaster.pid
++
++	### start the standby server
++	sed -i "s/^port = $PPGPORT/port = $SPGPORT/g" $PGDATA/postgresql.conf
++	sed -i "s/^ss_standby = 0/ss_standby = 1/g" $PGDATA/postgresql.conf
++	touch $PGDATA/standby.signal
++	
++	$PGBIN/pg_ctl -D $PGDATA -l /tmp/logfile-standby start
++	sleep 3
++else
++	### initialize the database
++	rm -rf $PGDATA
++	$PGBIN/initdb -D $PGDATA
++	
++	### start the primary server
++	#echo "shared_buffers = 128kB" >> $PGDATA/postgresql.conf
++	echo "port = $PPGPORT" >> $PGDATA/postgresql.conf
++	echo "ss_standby = 0" >> $PGDATA/postgresql.conf
++	echo "primary_conninfo = 'dbname=postgres host=127.0.0.1 port=$PPGPORT'" >> $PGDATA/postgresql.conf
++	
++	$PGBIN/pg_ctl -D $PGDATA -l /tmp/logfile-primary start
++	sleep 3
++	rm -rf $PGDATA/postmaster.pid
++	
++	### start the standby server
++	sed -i "s/^port = $PPGPORT/port = $SPGPORT/g" $PGDATA/postgresql.conf
++	sed -i "s/^ss_standby = 0/ss_standby = 1/g" $PGDATA/postgresql.conf
++	touch $PGDATA/standby.signal
++	
++	$PGBIN/pg_ctl -D $PGDATA -l /tmp/logfile-standby start
++	sleep 3
++fi
++
++rm -rf $PGDATA/postmaster.pid
++
++### check if both primary and standby are running
++netstat -anut | grep "$PPGPORT\|$SPGPORT"
++
++echo "Start Primary and Standby servers is done"
