@@ -1,0 +1,185 @@
+diff --git a/src/backend/access/rmgrdesc/smgrdesc.c b/src/backend/access/rmgrdesc/smgrdesc.c
+index 7547813254..74bae53524 100644
+--- a/src/backend/access/rmgrdesc/smgrdesc.c
++++ b/src/backend/access/rmgrdesc/smgrdesc.c
+@@ -40,6 +40,17 @@ smgr_desc(StringInfo buf, XLogReaderState *record)
+ 						 xlrec->blkno, xlrec->flags);
+ 		pfree(path);
+ 	}
++	else if (info == XLOG_SMGR_PAGE_NEW)
++	{
++		xl_smgr_page_new *xlrec = (xl_smgr_page_new *) rec;
++		char	   *path = relpathperm(xlrec->rnode, xlrec->forkNum);
++
++		appendStringInfo(buf, "%s to buftag: %u/%u/%u/%d/%u",
++						 path, xlrec->rnode.spcNode, xlrec->rnode.dbNode,
++						 xlrec->rnode.relNode, xlrec->forkNum, xlrec->blockNum);
++
++		pfree(path);
++	}
+ }
+ 
+ const char *
+@@ -55,6 +66,9 @@ smgr_identify(uint8 info)
+ 		case XLOG_SMGR_TRUNCATE:
+ 			id = "TRUNCATE";
+ 			break;
++		case XLOG_SMGR_PAGE_NEW:
++			id = "PAGENEW";
++			break;
+ 	}
+ 
+ 	return id;
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 691b9622da..efee605d6c 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -111,6 +111,8 @@ extern uint32 bootstrap_data_checksum_version;
+ /* timeline ID to be used when bootstrapping */
+ #define BootstrapTimeLineID		1
+ 
++bool		my_standby = false;
++
+ /* User-settable parameters */
+ int			max_wal_size_mb = 1024; /* 1 GB */
+ int			min_wal_size_mb = 80;	/* 80 MB */
+diff --git a/src/backend/catalog/storage.c b/src/backend/catalog/storage.c
+index c06e414a38..c311a5c1b9 100644
+--- a/src/backend/catalog/storage.c
++++ b/src/backend/catalog/storage.c
+@@ -1058,6 +1058,35 @@ smgr_redo(XLogReaderState *record)
+ 
+ 		FreeFakeRelcacheEntry(rel);
+ 	}
++	else if (info == XLOG_SMGR_PAGE_NEW)
++	{
++		xl_smgr_page_new *xlrec = (xl_smgr_page_new *) XLogRecGetData(record);
++
++		/*
++		 * Add logic here to deal with new page when performing new page REDO
++		 */
++		ereport(WARNING, (errmsg("REDO PAGE_NEW: spcNode %u, dbNode %u, "
++				"relNode %u, blocknum %u, forknum %d ",
++				xlrec->rnode.spcNode, xlrec->rnode.dbNode,
++				xlrec->rnode.relNode, xlrec->blockNum, xlrec->forkNum)));
++	}
+ 	else
+ 		elog(PANIC, "smgr_redo: unknown op code %u", info);
+ }
++
++void log_smgr_page_new(const RelFileNode *rnode,
++		ForkNumber forkNum, BlockNumber blockNum)
++{
++	xl_smgr_page_new xlrec;
++	XLogRecPtr	EndPos;
++
++	xlrec.rnode = *rnode;
++	xlrec.forkNum = forkNum;
++	xlrec.blockNum = blockNum;
++
++	XLogBeginInsert();
++	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
++	EndPos = XLogInsert(RM_SMGR_ID, XLOG_SMGR_PAGE_NEW);
++	XLogFlush(EndPos);
++}
++
+diff --git a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+index a477f70f0e..5e57f21821 100644
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -18,6 +18,7 @@
+ #include "postgres.h"
+ 
+ #include "access/xlogutils.h"
++#include "access/xlog.h"
+ #include "lib/ilist.h"
+ #include "storage/bufmgr.h"
+ #include "storage/ipc.h"
+@@ -25,6 +26,8 @@
+ #include "storage/smgr.h"
+ #include "utils/hsearch.h"
+ #include "utils/inval.h"
++#include "storage/md.h"
++#include "catalog/storage_xlog.h"
+ 
+ 
+ /*
+@@ -493,6 +496,15 @@ void
+ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		   char *buffer, bool skipFsync)
+ {
++	if (!my_standby && !RecoveryInProgress())
++	{
++		log_smgr_page_new(&reln->smgr_rnode.node, forknum, blocknum);
++		ereport(WARNING, (errmsg("Add PAGE_NEW xlog record: spcNode %u, dbNode %u, "
++				"relNode %u, blocknum %u, forknum %d ",
++				reln->smgr_rnode.node.spcNode, reln->smgr_rnode.node.dbNode,
++				reln->smgr_rnode.node.relNode, forknum, blocknum)));
++	}
++
+ 	smgrsw[reln->smgr_which].smgr_extend(reln, forknum, blocknum,
+ 										 buffer, skipFsync);
+ 
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index e9084f4506..e16eeacff5 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -2171,6 +2171,14 @@ static struct config_bool ConfigureNamesBool[] =
+ 		false,
+ 		NULL, NULL, NULL
+ 	},
++	{
++		{"my_standby", PGC_POSTMASTER, REPLICATION_STANDBY,
++			gettext_noop("Set server in standby mode"),
++		},
++		&my_standby,
++		false,
++		NULL, NULL, NULL
++	},
+ 
+ 	/* End-of-list marker */
+ 	{
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index cd674c3c23..1b8820967d 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -26,6 +26,8 @@
+ #define SYNC_METHOD_OPEN_DSYNC	4	/* for O_DSYNC */
+ extern PGDLLIMPORT int sync_method;
+ 
++extern bool my_standby;
++
+ extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
+ extern PGDLLIMPORT XLogRecPtr XactLastRecEnd;
+ extern PGDLLIMPORT XLogRecPtr XactLastCommitEnd;
+diff --git a/src/include/catalog/storage_xlog.h b/src/include/catalog/storage_xlog.h
+index 622de22b03..d292df8e77 100644
+--- a/src/include/catalog/storage_xlog.h
++++ b/src/include/catalog/storage_xlog.h
+@@ -29,6 +29,7 @@
+ /* XLOG gives us high 4 bits */
+ #define XLOG_SMGR_CREATE	0x10
+ #define XLOG_SMGR_TRUNCATE	0x20
++#define XLOG_SMGR_PAGE_NEW	0x40	/* record a page new xlog */
+ 
+ typedef struct xl_smgr_create
+ {
+@@ -50,7 +51,18 @@ typedef struct xl_smgr_truncate
+ 	int			flags;
+ } xl_smgr_truncate;
+ 
++typedef struct xl_smgr_page_new
++{
++	RelFileNode	rnode;
++	ForkNumber 	forkNum;
++	BlockNumber blockNum;
++	/*
++	 * required parameters
++	 */
++} xl_smgr_page_new;
++
+ extern void log_smgrcreate(const RelFileNode *rnode, ForkNumber forkNum);
++extern void log_smgr_page_new(const RelFileNode *rnode, ForkNumber forkNum, BlockNumber blockNum);
+ 
+ extern void smgr_redo(XLogReaderState *record);
+ extern void smgr_desc(StringInfo buf, XLogReaderState *record);
