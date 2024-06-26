@@ -968,6 +968,31 @@ index 0000000000..b4f43b9252
 +echo "[`date`] Postgres cluster deployment is done !!!"
 +
 +
+diff --git a/pgenv_fdw b/pgenv_fdw
+new file mode 100644
+index 0000000000..fdc6fe2111
+--- /dev/null
++++ b/pgenv_fdw
+@@ -0,0 +1,19 @@
++### common 
++PGBIN=/home/caryh/highgo/git/training/postgres.deadlock/highgo/bin
++
++CN=1
++DN=4
++GTM=enable
++
++PGPORT_C=5000
++PGPORT_D=6000
++PGPORT_G=40000
++
++PGLOG_C=/tmp/logfile_c
++PGLOG_D=/tmp/logfile_d
++PGLOG_G=/tmp/logfile_g
++
++PGDATA_C=/home/caryh/highgo/git/training/postgres.deadlock/pgdata_c
++PGDATA_D=/home/caryh/highgo/git/training/postgres.deadlock/pgdata_d
++PGDATA_G=/home/caryh/highgo/git/training/postgres.deadlock/pgdata_g
++
 diff --git a/src/Makefile b/src/Makefile
 index 79e274a476..542df65235 100644
 --- a/src/Makefile
