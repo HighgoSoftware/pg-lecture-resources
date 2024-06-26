@@ -1,0 +1,4490 @@
+diff --git a/contrib/postgres_fdw/connection.c b/contrib/postgres_fdw/connection.c
+index 5187ea8e00..a67163f0de 100644
+--- a/contrib/postgres_fdw/connection.c
++++ b/contrib/postgres_fdw/connection.c
+@@ -11,7 +11,7 @@
+  *-------------------------------------------------------------------------
+  */
+ #include "postgres.h"
+-
++#include "access/fdwxact.h"
+ #include "access/htup_details.h"
+ #include "access/xact.h"
+ #include "catalog/pg_user_mapping.h"
+@@ -29,6 +29,7 @@
+ #include "utils/inval.h"
+ #include "utils/memutils.h"
+ #include "utils/syscache.h"
++#include "utils/guc.h"
+ 
+ /*
+  * Connection cache hash table entry
+@@ -66,6 +67,11 @@ typedef struct ConnCacheEntry
+ 	uint32		server_hashvalue;	/* hash value of foreign server OID */
+ 	uint32		mapping_hashvalue;	/* hash value of user mapping OID */
+ 	PgFdwConnState state;		/* extra per-connection state */
++
++	//c.huang added
++	bool		modified;		/* true if data on the foreign server is modified */
++	void		*storage;		/* connection specific storage */
++	bool		xact_got_connection;
+ } ConnCacheEntry;
+ 
+ /*
+@@ -78,7 +84,7 @@ static unsigned int cursor_number = 0;
+ static unsigned int prep_stmt_number = 0;
+ 
+ /* tracks whether any work is needed in callback functions */
+-static bool xact_got_connection = false;
++//static bool xact_got_connection = false;
+ 
+ /*
+  * SQL functions
+@@ -96,7 +102,7 @@ static void configure_remote_session(PGconn *conn);
+ static void do_sql_command_begin(PGconn *conn, const char *sql);
+ static void do_sql_command_end(PGconn *conn, const char *sql,
+ 							   bool consume_input);
+-static void begin_remote_xact(ConnCacheEntry *entry);
++static void begin_remote_xact(ConnCacheEntry *entry, Oid serverid, Oid userid);
+ static void pgfdw_xact_callback(XactEvent event, void *arg);
+ static void pgfdw_subxact_callback(SubXactEvent event,
+ 								   SubTransactionId mySubid,
+@@ -117,6 +123,13 @@ static void pgfdw_finish_pre_subcommit_cleanup(List *pending_entries,
+ static bool UserMappingPasswordRequired(UserMapping *user);
+ static bool disconnect_cached_connections(Oid serverid);
+ 
++static ConnCacheEntry *GetConnectionCacheEntry(Oid umid);
++static void pgfdw_cleanup_after_transaction(ConnCacheEntry *entry);
++static ConnCacheEntry *GetConnectionState(Oid umid, bool will_prep_stmt,
++										  bool start_transaction);
++static int pgfdw_end_prepared_xact(ConnCacheEntry *entry, char *fdwxact_id,
++									bool is_commit);
++
+ /*
+  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
+  * server with the user's authorization.  A new connection is established
+@@ -154,7 +167,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
+ 		 * Register some callback functions that manage connection cleanup.
+ 		 * This should be done just once in each backend.
+ 		 */
+-		RegisterXactCallback(pgfdw_xact_callback, NULL);
++//		RegisterXactCallback(pgfdw_xact_callback, NULL);
+ 		RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
+ 		CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
+ 									  pgfdw_inval_callback, (Datum) 0);
+@@ -162,9 +175,6 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
+ 									  pgfdw_inval_callback, (Datum) 0);
+ 	}
+ 
+-	/* Set flag that we did GetConnection during the current transaction */
+-	xact_got_connection = true;
+-
+ 	/* Create hash key for the entry.  Assume no pad bytes in key struct */
+ 	key = user->umid;
+ 
+@@ -181,6 +191,9 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
+ 		entry->conn = NULL;
+ 	}
+ 
++	/* Set flag that we did GetConnection during the current transaction */
++	entry->xact_got_connection = true;
++
+ 	/* Reject further use of connections which failed abort cleanup. */
+ 	pgfdw_reject_incomplete_xact_state_change(entry);
+ 
+@@ -214,7 +227,9 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
+ 		if (entry->state.pendingAreq)
+ 			process_pending_request(entry->state.pendingAreq);
+ 		/* Start a new transaction or subtransaction if needed. */
+-		begin_remote_xact(entry);
++
++		begin_remote_xact(entry, user->serverid, user->userid);
++//		begin_remote_xact(entry);
+ 	}
+ 	PG_CATCH();
+ 	{
+@@ -273,7 +288,8 @@ GetConnection(UserMapping *user, bool will_prep_stmt, PgFdwConnState **state)
+ 		if (entry->conn == NULL)
+ 			make_new_connection(entry, user);
+ 
+-		begin_remote_xact(entry);
++//		begin_remote_xact(entry);
++		begin_remote_xact(entry, user->serverid, user->userid);
+ 	}
+ 
+ 	/* Remember if caller will prepare statements */
+@@ -678,7 +694,7 @@ do_sql_command_end(PGconn *conn, const char *sql, bool consume_input)
+  * control which remote queries share a snapshot.
+  */
+ static void
+-begin_remote_xact(ConnCacheEntry *entry)
++begin_remote_xact(ConnCacheEntry *entry, Oid serverid, Oid userid)
+ {
+ 	int			curlevel = GetCurrentTransactionNestLevel();
+ 
+@@ -686,16 +702,32 @@ begin_remote_xact(ConnCacheEntry *entry)
+ 	if (entry->xact_depth <= 0)
+ 	{
+ 		const char *sql;
++		char transaction_cnxid[128] = {0};
++		char sql2[512] = {0};
+ 
+ 		elog(DEBUG3, "starting remote transaction on connection %p",
+ 			 entry->conn);
+ 
++		/* Register the foreign server to the transaction */
++		FdwXactRegisterXact(serverid, userid, false);
++
++		snprintf(transaction_cnxid, sizeof(transaction_cnxid), "SET transaction_cnxid = '%s_%u';", cluster_name, GetTopTransactionId());
++		if (strlen(cluster_name) > 0 && strspn(cluster_name, "0123456789") != strlen(cluster_name))
++		{
++			elog(WARNING, "cluster_name %s contains letters, which will impact the functionality of global deadlock detection at GTM node. Please ensure the "
++					"cluster_name to contain only numbers", cluster_name);
++		}
++
+ 		if (IsolationIsSerializable())
+ 			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+ 		else
+ 			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
++
++		snprintf(sql2, sizeof(sql2), "%s;%s", sql, transaction_cnxid);
++
++		elog(WARNING, "Begin Query: %s", sql2);
+ 		entry->changing_xact_state = true;
+-		do_sql_command(entry->conn, sql);
++		do_sql_command(entry->conn, sql2);
+ 		entry->xact_depth = 1;
+ 		entry->changing_xact_state = false;
+ 	}
+@@ -780,7 +812,7 @@ pgfdw_exec_query(PGconn *conn, const char *query, PgFdwConnState *state)
+ 	 * block.  But its risk is relatively small, so we ignore that for now.
+ 	 */
+ 	if (!PQsendQuery(conn, query))
+-		pgfdw_report_error(ERROR, NULL, conn, false, query);
++		pgfdw_report_error(WARNING, NULL, conn, false, query);
+ 
+ 	/* Wait for the result. */
+ 	return pgfdw_get_result(conn, query);
+@@ -826,7 +858,7 @@ pgfdw_get_result(PGconn *conn, const char *query)
+ 				if (wc & WL_SOCKET_READABLE)
+ 				{
+ 					if (!PQconsumeInput(conn))
+-						pgfdw_report_error(ERROR, NULL, conn, false, query);
++						pgfdw_report_error(WARNING, NULL, conn, false, query);
+ 				}
+ 			}
+ 
+@@ -841,7 +873,7 @@ pgfdw_get_result(PGconn *conn, const char *query)
+ 	PG_CATCH();
+ 	{
+ 		PQclear(last_res);
+-		PG_RE_THROW();
++//		PG_RE_THROW();	//c.huang: do not abort on failure, GTM can handle later
+ 	}
+ 	PG_END_TRY();
+ 
+@@ -924,9 +956,9 @@ pgfdw_xact_callback(XactEvent event, void *arg)
+ 	ConnCacheEntry *entry;
+ 	List	   *pending_entries = NIL;
+ 
+-	/* Quick exit if no connections were touched in this transaction. */
+-	if (!xact_got_connection)
+-		return;
++//	/* Quick exit if no connections were touched in this transaction. */
++//	if (!entry->xact_got_connection)
++//		return;
+ 
+ 	/*
+ 	 * Scan all connection cache entries to find open remote transactions, and
+@@ -937,6 +969,10 @@ pgfdw_xact_callback(XactEvent event, void *arg)
+ 	{
+ 		PGresult   *res;
+ 
++		/* Quick exit if no connections were touched in this transaction. */
++		if (!entry->xact_got_connection)
++			return;
++
+ 		/* Ignore cache entry if no open connection right now */
+ 		if (entry->conn == NULL)
+ 			continue;
+@@ -1038,7 +1074,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
+ 	 * transaction.  (Note: if we are here during PRE_COMMIT or PRE_PREPARE,
+ 	 * this saves a useless scan of the hashtable during COMMIT or PREPARE.)
+ 	 */
+-	xact_got_connection = false;
++	entry->xact_got_connection = false;
+ 
+ 	/* Also reset cursor numbering for next transaction */
+ 	cursor_number = 0;
+@@ -1062,8 +1098,8 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+ 		return;
+ 
+ 	/* Quick exit if no connections were touched in this transaction. */
+-	if (!xact_got_connection)
+-		return;
++//	if (!xact_got_connection)
++//		return;
+ 
+ 	/*
+ 	 * Scan all connection cache entries to find open remote subtransactions
+@@ -1075,6 +1111,9 @@ pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+ 	{
+ 		char		sql[100];
+ 
++		/* Quick exit if no connections were touched in this transaction. */
++		if (!entry->xact_got_connection)
++			continue;
+ 		/*
+ 		 * We only care about connections with open remote subtransactions of
+ 		 * the current level.
+@@ -1865,3 +1904,510 @@ disconnect_cached_connections(Oid serverid)
+ 
+ 	return result;
+ }
++
++
++/*
++ * Get connection cache entry. Unlike GetConenctionState function, this function
++ * doesn't establish new connection even if not yet.
++ */
++static ConnCacheEntry *
++GetConnectionCacheEntry(Oid umid)
++{
++	ConnCacheEntry *entry;
++	ConnCacheKey	key;
++	bool			found;
++
++	/* Create hash key for the entry.  Assume no pad bytes in key struct */
++	key = umid;
++
++	/* First time through, initialize connection cache hashtable */
++	if (ConnectionHash == NULL)
++	{
++		HASHCTL		ctl;
++
++		MemSet(&ctl, 0, sizeof(ctl));
++		ctl.keysize = sizeof(ConnCacheKey);
++		ctl.entrysize = sizeof(ConnCacheEntry);
++		/* allocate ConnectionHash in the cache context */
++		ctl.hcxt = CacheMemoryContext;
++		ConnectionHash = hash_create("postgres_fdw connections", 8,
++									 &ctl,
++									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++		/*
++		 * Register some callback functions that manage connection cleanup.
++		 * This should be done just once in each backend.
++		 */
++		RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
++		CacheRegisterSyscacheCallback(FOREIGNSERVEROID,
++									  pgfdw_inval_callback, (Datum) 0);
++		CacheRegisterSyscacheCallback(USERMAPPINGOID,
++									  pgfdw_inval_callback, (Datum) 0);
++	}
++
++	/*
++	 * Find or create cached entry for requested connection.
++	 */
++	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
++	if (!found)
++	{
++		/*
++		 * We need only clear "conn" here; remaining fields will be filled
++		 * later when "conn" is set.
++		 */
++		entry->conn = NULL;
++	}
++
++	return entry;
++}
++
++/* Cleanup at main-transaction end */
++static void
++pgfdw_cleanup_after_transaction(ConnCacheEntry *entry)
++{
++	/* Reset state to show we're out of a transaction */
++	entry->xact_depth = 0;
++	entry->have_prep_stmt = false;
++	entry->have_error  = false;
++	entry->xact_got_connection = false;
++//	entry->imported_csn = InvalidCSN;
++
++	/*
++	 * If the connection isn't in a good idle state, discard it to
++	 * recover. Next GetConnection will open a new connection.
++	 */
++	if (PQstatus(entry->conn) != CONNECTION_OK ||
++		PQtransactionStatus(entry->conn) != PQTRANS_IDLE ||
++		entry->changing_xact_state)
++	{
++		elog(DEBUG3, "discarding connection %p", entry->conn);
++		disconnect_pg_server(entry);
++	}
++
++	entry->changing_xact_state = false;
++	entry->modified = false;	// c.huang: we are done, so mark it as no longer modified
++	/* Also reset cursor numbering for next transaction */
++	cursor_number = 0;
++}
++
++/*
++ * This function gets the connection cache entry and establishes connection
++ * to the foreign server if there is no connection and starts a new transaction
++ * if 'start_transaction' is true.
++ */
++static ConnCacheEntry *
++GetConnectionState(Oid umid, bool will_prep_stmt, bool start_transaction)
++{
++	ConnCacheEntry *entry;
++
++	entry = GetConnectionCacheEntry(umid);
++
++	/* Reject further use of connections which failed abort cleanup. */
++	pgfdw_reject_incomplete_xact_state_change(entry);
++
++	/*
++	 * If the connection needs to be remade due to invalidation, disconnect as
++	 * soon as we're out of all transactions.
++	 */
++	if (entry->conn != NULL && entry->invalidated && entry->xact_depth == 0)
++	{
++		elog(DEBUG3, "closing connection %p for option changes to take effect",
++			 entry->conn);
++		disconnect_pg_server(entry);
++	}
++
++	/*
++	 * We don't check the health of cached connection here, because it would
++	 * require some overhead.  Broken connection will be detected when the
++	 * connection is actually used.
++	 */
++
++	/*
++	 * If cache entry doesn't have a connection, we have to establish a new
++	 * connection.  (If connect_pg_server throws an error, the cache entry
++	 * will remain in a valid empty state, ie conn == NULL.)
++	 */
++	if (entry->conn == NULL)
++	{
++		UserMapping	*user = GetUserMappingByOid(umid);
++		ForeignServer *server = GetForeignServer(user->serverid);
++
++		/* Reset all transient state fields, to be sure all are clean */
++		entry->xact_depth = 0;
++		entry->have_prep_stmt = false;
++		entry->have_error = false;
++		entry->changing_xact_state = false;
++		entry->invalidated = false;
++		entry->xact_got_connection = false;
++//		entry->imported_csn = InvalidCSN;
++		entry->modified = false;
++		entry->server_hashvalue =
++			GetSysCacheHashValue1(FOREIGNSERVEROID,
++								  ObjectIdGetDatum(server->serverid));
++		entry->mapping_hashvalue =
++			GetSysCacheHashValue1(USERMAPPINGOID,
++								  ObjectIdGetDatum(user->umid));
++
++		/* Now try to make the connection */
++		entry->conn = connect_pg_server(server, user);
++
++		Assert(entry->conn);
++
++		if (!entry->conn)
++		{
++			elog(DEBUG3, "attempt to connection to server \"%s\" by postgres_fdw failed",
++				 server->servername);
++			return NULL;
++		}
++
++		elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\" (user mapping oid %u, userid %u)",
++			 entry->conn, server->servername, user->umid, user->userid);
++		entry->storage = NULL;
++	}
++
++	/*
++	 * Start a new transaction or subtransaction if needed.
++	 */
++	if (start_transaction)
++	{
++		UserMapping		*user = GetUserMappingByOid(umid);
++
++		//c.huang changed
++		begin_remote_xact(entry, user->serverid, user->userid);
++//		begin_remote_xact(entry);
++
++		/* Set flag that we did GetConnection during the current transaction */
++		entry->xact_got_connection = true;
++	}
++
++	/* Remember if caller will prepare statements */
++	entry->have_prep_stmt |= will_prep_stmt;
++
++	return entry;
++}
++
++/*
++ * Commit or rollback prepared transaction on the foreign server.
++ * return -1 if failed, 0 if success
++ */
++static int
++pgfdw_end_prepared_xact(ConnCacheEntry *entry, char *fdwxact_id, bool is_commit)
++{
++	StringInfo	command;
++	PGresult	*res;
++	int ret = -1;
++
++	command = makeStringInfo();
++	appendStringInfo(command, "%s PREPARED '%s'",
++					 is_commit ? "COMMIT" : "ROLLBACK",
++					 fdwxact_id);
++
++	elog(WARNING, "%s: %s PREPARE transaction %s",
++			__FUNCTION__, is_commit ? "COMMIT" : "ROLLBACK", fdwxact_id);
++
++	res = pgfdw_exec_query(entry->conn, command->data, NULL);
++
++	if (PQresultStatus(res) != PGRES_COMMAND_OK)
++	{
++//		elog(WARNING, "%s: Failed to %s PREPARE transaction %s. Let external GTM handle it",
++//					__FUNCTION__, is_commit ? "COMMIT" : "ROLLBACK", fdwxact_id);
++
++		ereport(WARNING,
++				(errmsg("%s PREPARED transaction %s failed", is_commit ? "COMMIT" : "ROLLBACK", fdwxact_id),
++				 errdetail("The transaction has already committed/rollback locally, but might not have been committed/rollback on the foreign server.")));
++
++//		int		sqlstate;
++//		char	*diag_sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
++//
++//		if (diag_sqlstate)
++//		{
++//			sqlstate = MAKE_SQLSTATE(diag_sqlstate[0],
++//									 diag_sqlstate[1],
++//									 diag_sqlstate[2],
++//									 diag_sqlstate[3],
++//									 diag_sqlstate[4]);
++//		}
++//		else
++//			sqlstate = ERRCODE_CONNECTION_FAILURE;
++//
++//		/*
++//		 * As core global transaction manager states, it's possible that the
++//		 * given foreign transaction doesn't exist on the foreign server. So
++//		 * we should accept an UNDEFINED_OBJECT error.
++//		 */
++//		if (sqlstate != ERRCODE_UNDEFINED_OBJECT)
++//			pgfdw_report_error(ERROR, res, entry->conn, false, command->data);
++	}
++	else
++	{
++
++		elog(DEBUG1, "%s prepared foreign transaction with ID %s",
++			 is_commit ? "commit" : "rollback",
++			 fdwxact_id);
++		ret = 0;
++	}
++
++	/* Cleanup transaction status */
++	pgfdw_cleanup_after_transaction(entry);
++	return ret;
++}
++
++void
++MarkConnectionModified(UserMapping *user)
++{
++	ConnCacheEntry *entry;
++
++	entry = GetConnectionCacheEntry(user->umid);
++
++	if (entry && !entry->modified)
++	{
++		FdwXactRegisterXact(user->serverid, user->userid, true);
++		entry->modified = true;
++	}
++}
++
++/*
++ * Prepare a transaction on foreign server.
++ */
++void
++postgresPrepareForeignTransaction(FdwXactRslvState *state)
++{
++	ConnCacheEntry *entry = NULL;
++	PGresult	*res;
++	StringInfo	command;
++
++	/* The transaction should have started already get the cache entry */
++	entry = GetConnectionCacheEntry(state->usermapping->umid);
++
++	/* The transaction should have been started */
++	Assert(entry->xact_got_connection && entry->conn);
++
++	pgfdw_reject_incomplete_xact_state_change(entry);
++
++	command = makeStringInfo();
++	appendStringInfo(command, "PREPARE TRANSACTION '%s'", state->fdwxact_id);
++
++	elog(WARNING, "%s: PREPARE transaction %s on server %s",
++			__FUNCTION__, state->fdwxact_id, state->server->servername);
++	/* Do commit foreign transaction */
++	entry->changing_xact_state = true;
++	res = pgfdw_exec_query(entry->conn, command->data, NULL);
++	entry->changing_xact_state = false;
++
++	if (PQresultStatus(res) != PGRES_COMMAND_OK)
++		ereport(ERROR, (errmsg("could not prepare transaction on server %s with ID %s",
++							   state->server->servername, state->fdwxact_id)));
++
++	elog(DEBUG1, "prepared foreign transaction on server %s with ID %s",
++		 state->server->servername, state->fdwxact_id);
++
++	if (entry->have_prep_stmt && entry->have_error)
++	{
++		res = PQexec(entry->conn, "DEALLOCATE ALL");
++		PQclear(res);
++	}
++
++	pgfdw_cleanup_after_transaction(entry);
++}
++
++/*
++ * Commit a transaction or a prepared transaction on foreign server. If
++ * state->flags contains FDWXACT_FLAG_ONEPHASE this function can commit the
++ * foreign transaction without preparation, otherwise commit the prepared
++ * transaction.
++ */
++void
++postgresCommitForeignTransaction(FdwXactRslvState *state)
++{
++	ConnCacheEntry *entry = NULL;
++	bool			is_onephase = (state->flags & FDWXACT_FLAG_ONEPHASE) != 0;
++	PGresult		*res;
++
++	if (!is_onephase)
++	{
++		int 			ret = -1;
++		/*
++		 * In two-phase commit case, the foreign transaction has prepared and
++		 * closed, so we might not have a connection to it. We get a connection
++		 * but don't start transaction.
++		 */
++		entry = GetConnectionState(state->usermapping->umid, false, false);
++
++		/* COMMIT PREPARED the transaction */
++		ret = pgfdw_end_prepared_xact(entry, state->fdwxact_id, true);
++		if (ret)
++			state->isEnded = false;
++		else
++			state->isEnded = true;
++
++		return;
++	}
++
++	/*
++	 * In simple commit case, we must have a connection to the foreign server
++	 * because the foreign transaction is not closed yet. We get the connection
++	 * entry from the cache.
++	 */
++	entry = GetConnectionCacheEntry(state->usermapping->umid);
++	Assert(entry);
++
++	if (!entry->conn || !entry->xact_got_connection)
++		return;
++
++	/*
++	 * If abort cleanup previously failed for this connection, we can't issue
++	 * any more commands against it.
++	 */
++	pgfdw_reject_incomplete_xact_state_change(entry);
++
++	elog(DEBUG2, "%s: COMMIT transaction", __FUNCTION__);
++
++	entry->changing_xact_state = true;
++	res = pgfdw_exec_query(entry->conn, "COMMIT TRANSACTION", NULL);
++	entry->changing_xact_state = false;
++
++	if (PQresultStatus(res) != PGRES_COMMAND_OK)
++		ereport(ERROR, (errmsg("could not commit transaction on server %s",
++							   state->server->servername)));
++
++	/*
++	 * If there were any errors in subtransactions, and we ma
++	 * made prepared statements, do a DEALLOCATE ALL to make
++	 * sure we get rid of all prepared statements. This is
++	 * annoying and not terribly bulletproof, but it's
++	 * probably not worth trying harder.
++	 *
++	 * DEALLOCATE ALL only exists in 8.3 and later, so this
++	 * constrains how old a server postgres_fdw can
++	 * communicate with.  We intentionally ignore errors in
++	 * the DEALLOCATE, so that we can hobble along to some
++	 * extent with older servers (leaking prepared statements
++	 * as we go; but we don't really support update operations
++	 * pre-8.3 anyway).
++	 */
++	if (entry->have_prep_stmt && entry->have_error)
++	{
++		res = PQexec(entry->conn, "DEALLOCATE ALL");
++		PQclear(res);
++	}
++
++	/* Cleanup transaction status */
++	pgfdw_cleanup_after_transaction(entry);
++}
++
++/*
++ * Rollback a transaction on foreign server. As with commit case, if state->flags
++ * contains FDWAXCT_FLAG_ONEPHASE this function can rollback the foreign
++ * transaction without preparation, other wise rollback the prepared transaction.
++ * This function must tolerate to being called recursively as an error can happen
++ * during aborting.
++ */
++void
++postgresRollbackForeignTransaction(FdwXactRslvState *state)
++{
++	bool			is_onephase = (state->flags & FDWXACT_FLAG_ONEPHASE) != 0;
++	ConnCacheEntry *entry = NULL;
++	bool abort_cleanup_failure = false;
++
++	if (!is_onephase)
++	{
++		int 			ret = -1;
++		/*
++		 * In two-phase commit case, the foreign transaction has prepared and
++		 * closed, so we might not have a connection to it. We get a connection
++		 * but don't start transaction.
++		 */
++		entry = GetConnectionState(state->usermapping->umid, false, false);
++
++		/* ROLLBACK PREPARED the transaction */
++		ret = pgfdw_end_prepared_xact(entry, state->fdwxact_id, false);
++		if (ret)
++			state->isEnded = false;
++		else
++			state->isEnded = true;
++
++		return;
++	}
++
++	/*
++	 * In simple rollback case, we must have a connection to the foreign server
++	 * because the foreign transaction is not closed yet. We get the connection
++	 * entry from the cache.
++	 */
++	entry = GetConnectionCacheEntry(state->usermapping->umid);
++	Assert(entry);
++
++	/*
++	 * Cleanup connection entry transaction if transaction fails before
++	 * establishing a connection or starting transaction.
++	 */
++	if (!entry->conn || !entry->xact_got_connection)
++	{
++		pgfdw_cleanup_after_transaction(entry);
++		return;
++	}
++
++	/*
++	 * Don't try to clean up the connection if we're already
++	 * in error recursion trouble.
++	 */
++	if (in_error_recursion_trouble())
++		entry->changing_xact_state = true;
++
++	/*
++	 * If connection is before starting transaction or is already unsalvageable,
++	 * do only the cleanup and don't touch it further.
++	 */
++	if (entry->changing_xact_state || !entry->xact_got_connection)
++	{
++		pgfdw_cleanup_after_transaction(entry);
++		return;
++	}
++
++	/*
++	 * Mark this connection as in the process of changing
++	 * transaction state.
++	 */
++	entry->changing_xact_state = true;
++
++	/* Assume we might have lost track of prepared statements */
++	entry->have_error = true;
++
++	/*
++	 * If a command has been submitted to the remote server by
++	 * using an asynchronous execution function, the command
++	 * might not have yet completed.  Check to see if a
++	 * command is still being processed by the remote server,
++	 * and if so, request cancellation of the command.
++	 */
++	if (PQtransactionStatus(entry->conn) == PQTRANS_ACTIVE &&
++		!pgfdw_cancel_query(entry->conn))
++	{
++		/* Unable to cancel running query. */
++		abort_cleanup_failure = true;
++	}
++	else if (!pgfdw_exec_cleanup_query(entry->conn,
++									   "ABORT TRANSACTION",
++									   false))
++	{
++		/* Unable to abort remote transaction. */
++		abort_cleanup_failure = true;
++	}
++	else if (entry->have_prep_stmt && entry->have_error &&
++			 !pgfdw_exec_cleanup_query(entry->conn,
++									   "DEALLOCATE ALL",
++									   true))
++	{
++		/* Trouble clearing prepared statements. */
++		abort_cleanup_failure = true;
++	}
++
++	/* Disarm changing_xact_state if it all worked. */
++	entry->changing_xact_state = abort_cleanup_failure;
++
++	/* Cleanup transaction status */
++	pgfdw_cleanup_after_transaction(entry);
++
++	return;
++}
++
+diff --git a/contrib/postgres_fdw/postgres_fdw.c b/contrib/postgres_fdw/postgres_fdw.c
+index b08b314f9f..f05179e334 100644
+--- a/contrib/postgres_fdw/postgres_fdw.c
++++ b/contrib/postgres_fdw/postgres_fdw.c
+@@ -14,6 +14,7 @@
+ 
+ #include <limits.h>
+ 
++#include "access/fdwxact.h"
+ #include "access/htup_details.h"
+ #include "access/sysattr.h"
+ #include "access/table.h"
+@@ -602,6 +603,13 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
+ 	/* Support functions for upper relation push-down */
+ 	routine->GetForeignUpperPaths = postgresGetForeignUpperPaths;
+ 
++	/* Support functions for foreign transactions */
++	routine->PrepareForeignTransaction = postgresPrepareForeignTransaction;
++	routine->CommitForeignTransaction = postgresCommitForeignTransaction;
++	routine->RollbackForeignTransaction = postgresRollbackForeignTransaction;
++	/* Global CSN snapshot functions */
++	//routine->PrepareForeignCSNSnapshot = postgresPrepareForeignCSNSnapshot;
++	//routine->AssignGlobalCSN = postgresAssignGlobalCSN;
+ 	/* Support functions for asynchronous execution */
+ 	routine->IsForeignPathAsyncCapable = postgresIsForeignPathAsyncCapable;
+ 	routine->ForeignAsyncRequest = postgresForeignAsyncRequest;
+@@ -2668,6 +2676,8 @@ postgresBeginDirectModify(ForeignScanState *node, int eflags)
+ 	 */
+ 	dmstate->conn = GetConnection(user, false, &dmstate->conn_state);
+ 
++	MarkConnectionModified(user);
++
+ 	/* Update the foreign-join-related fields. */
+ 	if (fsplan->scan.scanrelid == 0)
+ 	{
+diff --git a/contrib/postgres_fdw/postgres_fdw.h b/contrib/postgres_fdw/postgres_fdw.h
+index 21f2b20ce8..bbbb5773be 100644
+--- a/contrib/postgres_fdw/postgres_fdw.h
++++ b/contrib/postgres_fdw/postgres_fdw.h
+@@ -13,6 +13,7 @@
+ #ifndef POSTGRES_FDW_H
+ #define POSTGRES_FDW_H
+ 
++#include "access/fdwxact.h"
+ #include "foreign/foreign.h"
+ #include "lib/stringinfo.h"
+ #include "libpq-fe.h"
+@@ -151,6 +152,10 @@ extern PGresult *pgfdw_exec_query(PGconn *conn, const char *query,
+ 								  PgFdwConnState *state);
+ extern void pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
+ 							   bool clear, const char *sql);
++extern void postgresPrepareForeignTransaction(FdwXactRslvState *state);
++extern void postgresCommitForeignTransaction(FdwXactRslvState *state);
++extern void postgresRollbackForeignTransaction(FdwXactRslvState *state);
++extern void MarkConnectionModified(UserMapping *user);
+ 
+ /* in option.c */
+ extern int	ExtractConnectionOptions(List *defelems,
+diff --git a/distributedPG.sh b/distributedPG.sh
+new file mode 100755
+index 0000000000..b4f43b9252
+--- /dev/null
++++ b/distributedPG.sh
+@@ -0,0 +1,156 @@
++#!/bin/bash
++
++#set -x
++
++
++### load local environment
++source pgenv_fdw
++
++### default to initdb
++OPT1=${1:-init}
++
++
++echo "[`date`] Postgres cluster deployment started ..."
++
++for ((i=1; i<$DN; i++))
++do
++	$PGBIN/pg_ctl -D ${PGDATA_D}${i} -l ${PGLOG_D}${i} stop
++	killall -9 postgres
++done
++
++for ((i=1; i<=$CN; i++))
++do
++	$PGBIN/pg_ctl -D ${PGDATA_C}${i} -l ${PGLOG_C}${i} stop
++	killall -9 postgres
++done
++
++if [ "$GTM" == "enable" ]; then
++	$PGBIN/pg_ctl -D ${PGDATA_G} -l ${PGLOG_G} stop
++	killall -9 postgres
++fi
++
++###  restart only
++if [ "$OPT1" == "restart" ]; then
++	if [ "$GTM" == "enable" ]; then
++		$PGBIN/pg_ctl -D ${PGDATA_G} -l ${PGLOG_G} start
++	fi
++
++	for ((i=1; i<$DN; i++))
++	do
++		$PGBIN/pg_ctl -D ${PGDATA_D}${i} -l ${PGLOG_D}${i} start
++		sleep 1
++	done
++
++	for ((i=1; i<=$CN; i++))
++	do
++		$PGBIN/pg_ctl -D ${PGDATA_C}${i} -l ${PGLOG_C}${i} start
++		sleep 1
++	done
++
++
++### start from initdb
++### step-1: Create PG clusters
++else
++	### step-1.0: Create GTM
++	if [ "$GTM" == "enable" ]; then
++		rm -rf ${PGDATA_G} ${PGLOG_G}
++		$PGBIN/initdb -D ${PGDATA_G} -U $USER
++		sed -i "s|#port = 5432|port = ${PGPORT_G}|g" ${PGDATA_G}/postgresql.conf
++		sed -i "s|#cluster_name = ''|cluster_name = 'GTM'|g" ${PGDATA_G}/postgresql.conf
++		echo "global_deadlock_detect_enable = on" >> ${PGDATA_G}/postgresql.conf
++
++		for ((i=1; i<=$DN; i++))
++                do
++                        if (( $i > 1 )); then
++                                conn_info_tmp+="|"
++                        fi
++                        conn_info_tmp+="dbname=postgres user=$USER host=127.0.0.1 port=${PGPORT_D}${i} sslmode=disable"
++                done
++                echo "gtm2dn_conninfo = '${conn_info_tmp}'" >> ${PGDATA_G}/postgresql.conf
++
++		$PGBIN/pg_ctl -D ${PGDATA_G} -l ${PGLOG_G} start
++	fi
++
++	### step-1.1: Create DN(s)
++	for ((i=1; i<=$DN; i++))
++	do
++		rm -rf ${PGDATA_D}${i} ${PGLOG_D}${i}
++		$PGBIN/initdb -D ${PGDATA_D}${i} -U $USER
++		sed -i "s|#port = 5432|port = ${PGPORT_D}${i}|g" ${PGDATA_D}${i}/postgresql.conf
++		echo "max_prepared_transactions = 60" >> ${PGDATA_D}${i}/postgresql.conf
++		echo "gtm2pc_conninfo = 'dbname=postgres user=$USER host=127.0.0.1 port=${PGPORT_G} sslmode=disable'" >> ${PGDATA_D}${i}/postgresql.conf
++		sed -i "s|#cluster_name = ''|cluster_name = 'DN${i}'|g" ${PGDATA_D}${i}/postgresql.conf
++		echo "fdw_xact_self_resolve = true" >> ${PGDATA_D}${i}/postgresql.conf
++		#echo "fdw_xact_max_age = 60s" >> ${PGDATA_D}${i}/postgresql.conf
++		echo "fdw_xact_check_interval = 10s" >> ${PGDATA_D}${i}/postgresql.conf
++
++		$PGBIN/pg_ctl -D ${PGDATA_D}${i} -l ${PGLOG_D}${i} start
++
++		$PGBIN/psql -d postgres -p ${PGPORT_D}${i} -c "create extension postgres_fdw;"
++		$PGBIN/psql -d postgres -p ${PGPORT_D}${i} -c "\dx;"
++	done
++
++	### step-1.2: Create CN(s)
++	for ((i=1; i<=$CN; i++))
++	do
++		rm -rf ${PGDATA_C}${i} ${PGLOG_C}${i}
++		$PGBIN/initdb -D ${PGDATA_C}${i} -U $USER
++		sed -i "s|#port = 5432|port = ${PGPORT_C}${i}|g" ${PGDATA_C}${i}/postgresql.conf
++		echo "foreign_twophase_commit = required" >> ${PGDATA_C}${i}/postgresql.conf
++		echo "max_prepared_foreign_transactions = 60" >> ${PGDATA_C}${i}/postgresql.conf
++		echo "max_prepared_transactions = 60" >> ${PGDATA_C}${i}/postgresql.conf
++		echo "gtm2pc_conninfo = 'dbname=postgres user=$USER host=127.0.0.1 port=${PGPORT_G} sslmode=disable'" >> ${PGDATA_C}${i}/postgresql.conf
++		sed -i "s|#cluster_name = ''|cluster_name = '00${i}'|g" ${PGDATA_C}${i}/postgresql.conf
++
++		$PGBIN/pg_ctl -D ${PGDATA_C}${i} -l ${PGLOG_C}${i} start
++
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create extension postgres_fdw;"
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "\dx;"
++
++		for ((j=1; j<=$DN; j++))
++		do
++			$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create server s${j} foreign data wrapper postgres_fdw options (dbname 'postgres', host '127.0.0.1', port '${PGPORT_D}${j}');"
++			$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create user mapping for $USER server s${j} options( user '$USER');"
++		done
++	done
++
++	### step-1.3: Check CN(s) 
++	for ((i=1; i<=$CN; i++))
++	do
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "\des+;"
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "select * from pg_user_mappings;"
++	done
++fi
++
++
++### step-2: Check PG cluster is running
++
++### step-2.1: Check GTM
++if [ "$GTM" == "enable" ]; then
++	netstat -anut | grep "${PGPORT_G}"
++fi
++
++### step-2.2: Check DN(s) 
++for ((i=1; i<=$DN; i++))
++do
++	PGPORT_D_tmp+="${PGPORT_D}${i}"
++	if (( $i < ($DN) )); then 
++		PGPORT_D_tmp+="\|"
++	fi
++done
++netstat -anut | grep "${PGPORT_D_tmp}"
++
++### step-2.3: Check CN(s) 
++for ((i=1; i<=$CN; i++))
++do
++	PGPORT_C_tmp+="${PGPORT_C}${i}"
++	if (( $i < ($CN) )); then 
++		PGPORT_C_tmp+="\|"
++	fi
++done
++netstat -anut | grep "${PGPORT_C_tmp}"
++
++
++echo "[`date`] Postgres cluster deployment is done !!!"
++
++
+diff --git a/src/Makefile b/src/Makefile
+index 79e274a476..542df65235 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -22,6 +22,7 @@ SUBDIRS = \
+ 	include \
+ 	interfaces \
+ 	backend/replication/libpqwalreceiver \
++	backend/access/fdwxact/libpqfdwxact \
+ 	backend/replication/pgoutput \
+ 	fe_utils \
+ 	bin \
+diff --git a/src/backend/access/Makefile b/src/backend/access/Makefile
+index 0880e0a8bb..49480dd039 100644
+--- a/src/backend/access/Makefile
++++ b/src/backend/access/Makefile
+@@ -9,6 +9,6 @@ top_builddir = ../../..
+ include $(top_builddir)/src/Makefile.global
+ 
+ SUBDIRS	    = brin common gin gist hash heap index nbtree rmgrdesc spgist \
+-			  table tablesample transam
++			  table tablesample transam fdwxact
+ 
+ include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/fdwxact/Makefile b/src/backend/access/fdwxact/Makefile
+new file mode 100644
+index 0000000000..97f2663694
+--- /dev/null
++++ b/src/backend/access/fdwxact/Makefile
+@@ -0,0 +1,17 @@
++#-------------------------------------------------------------------------
++#
++# Makefile--
++#    Makefile for access/fdwxact
++#
++# IDENTIFICATION
++#    src/backend/access/fdwxact/Makefile
++#
++#-------------------------------------------------------------------------
++
++subdir = src/backend/access/fdwxact
++top_builddir = ../../../..
++include $(top_builddir)/src/Makefile.global
++
++OBJS = fdwxact.o launcher.o
++
++include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/fdwxact/README b/src/backend/access/fdwxact/README
+new file mode 100644
+index 0000000000..d9f08f4cfa
+--- /dev/null
++++ b/src/backend/access/fdwxact/README
+@@ -0,0 +1,110 @@
++src/backend/access/fdwxact/README
++
++Atomic Commit for Distributed Transactions
++===========================================
++
++The atomic commit feature enables us to commit and rollback either all of
++foreign servers or nothing. This ensures that the database data is always left
++in a consistent state in term of federated database.
++
++
++Commit Sequence of Global Transactions
++---------------------------------------
++
++We employee two-phase commit protocol to achieve commit among all foreign
++servers atomically. The sequence of distributed transaction commit consists
++of the following four steps:
++
++1. Foreign Server Registration
++During executor node initialization, accessed foreign servers are registered
++to the list FdwXactAtomicCommitParticipants, which is maintained by
++PostgreSQL's the global transaction manager (GTM), as a distributed transaction
++participant. The registered foreign transactions are tracked until the end of
++transaction.
++
++2. Pre-Commit phase (1st phase of two-phase commit)
++We record the corresponding WAL indicating that the foreign server is involved
++with the current transaction before doing PREPARE each foreign transactions.
++Thus in case we loose connectivity to the foreign server or crash ourselves,
++we will remember that we might have prepared transaction on the foreign
++server, and try to resolve it when connectivity is restored or after crash
++recovery.
++
++The two-phase commit is required only if the transaction modified two or more
++servers including the local node. In other case, we can commit them at this
++step by calling CommitForeignTransaction() API and no need further operation.
++
++After that we prepare all foreign transactions by calling
++PrepareForeignTransaction() API. If we failed on any of them we change to
++rollback, therefore at this time some participants might be prepared whereas
++some are not prepared. The former foreign transactions need to be resolved
++using pg_resolve_foreign_xact() manually and the latter ends transaction
++in one-phase by calling RollbackForeignTransaction() API.
++
++3. Commit locally
++Once we've prepared all of them, commit the transaction locally.
++
++4. Post-Commit Phase (2nd phase of two-phase commit)
++The steps so far are done by the backend process committing the transaction but
++this resolution step (commit or rollback) is done by the foreign transaction
++resolver process. The backend process inserts itself to the wait queue, and
++then wake up the resolver process (or request to launch new one if necessary).
++The resolver process enqueue the waiter and fetch the distributed transaction
++information that the backend is waiting for. Once all foreign transaction are
++committed or rollbacked the resolver process wake up the waiter.
++
++
++Foreign Data Wrapper Callbacks for Transaction Management
++-----------------------------------------------------------
++
++The core GTM manages the status of individual foreign transactions and calls
++transaction management callback functions according to its status. Each
++callback functions PrepareForeignTransaction, CommitForeignTransaction and
++RollbackForeignTransaction is responsible for PREPARE, COMMIT or ROLLBACK
++the transaction on the foreign server, respectively.
++FdwXactRslvState->flags could contain FDWXACT_FLAG_ONEPHASE, meaning FDW can
++commit or rollback the foreign transaction in one-phase. On failure during
++processing a foreign transaction, FDW needs to raise an error. However, FDW
++must accept ERRCODE_UNDEFINED_OBJECT error during committing or rolling back a
++foreign transaction, because there is a race condition that the coordinator
++could crash in time between the resolution is completed and writing the WAL
++removing the FdwXact entry.
++
++
++Foreign Transactions Status
++----------------------------
++
++Every foreign transactions will have an FdwXact entry. When preparing a foreign
++transaction a FdwXact entry of which status starts from FDWXACT_STATUS_PREPARING
++are created with WAL logging. The status changes to FDWXACT_STATUS_PREPARED
++after the foreign transaction is prepared and it changes to
++FDWXACT_STATUS_COMMITTING and FDWXACT_STATUS_ABORTING before the foreign
++transaction is committed and aborted by FDW callback functions respectively.
++FdwXact entry is removed once the foreign transaction is resolved with WAL
++logging.
++
++FdwXact entries recovered during the recovery are marked as in-doubt if the
++corresponding local transaction is not prepared transaction. The initial
++status is FDWXACT_STATUS_PREPARED(*1). Because the foreign transaction was
++being processed we cannot know the exact status. So we regard it as PREPARED
++for safety.
++
++The foreign transaction status transition is illustrated by the following graph
++describing the FdwXact->status:
++
++ +----------------------------------------------------+
++ |                     PREPARING                      |----+
++ +----------------------------------------------------+    |
++                          |                                |
++                          v                                |
++ +----------------------------------------------------+    |
++ |                    PREPARED(*1)                    |    | (*2)
++ +----------------------------------------------------+    |
++           |                               |               |
++           v                               v               |
++ +--------------------+          +--------------------+    |
++ |   COMMITTING(*1)   |          |    ABORTING(*1)    |<---+
++ +--------------------+          +--------------------+
++
++(*1) Recovered FdwXact entries starts with PREPARED
++(*2) Paths when an error occurrs during preparing
+diff --git a/src/backend/access/fdwxact/fdwxact.c b/src/backend/access/fdwxact/fdwxact.c
+new file mode 100644
+index 0000000000..08d0745e00
+--- /dev/null
++++ b/src/backend/access/fdwxact/fdwxact.c
+@@ -0,0 +1,1219 @@
++/*-------------------------------------------------------------------------
++ *
++ * fdwxact.c
++ *		PostgreSQL global transaction manager for foreign servers.
++ *
++ * This module contains the code for managing transactions started on foreign
++ * servers.
++ *
++ * An FDW that implements both commit and rollback APIs can request to register
++ * the foreign transaction by FdwXactRegisterXact() to participate it to a
++ * participant group.  The registered foreign transactions are identified by
++ * OIDs of server and user.  On commit and rollback, the global transaction manager
++ * calls corresponding FDW API to end the tranasctions.
++ *
++ * To achieve commit among all foreign servers atomically, the global transaction
++ * manager supports two-phase commit protocol, which is a type of atomic commitment
++ * protocol(ACP).  Foreign servers whose FDW implements prepare API are prepared
++ * when PREPARE TRANSACTION.  On COMMIT PREPARED or ROLLBACK PREPARED the local
++ * transaction, we collect the involved foreign transaction and wait for the resolver
++ * process committing or rolling back the foreign transactions.
++ *
++ * The global transaction manager support automatically foreign transaction
++ * resolution on commit and rollback.  The basic strategy is that we prepare all
++ * of the remote transactions before committing locally and commit them after
++ * committing locally.
++ *
++ * During pre-commit of local transaction, we prepare the transaction on
++ * all foreign servers.  And after committing or rolling back locally,
++ * we notify the resolver process and tell it to commit or rollback those
++ * transactions. If we ask to commit, we also tell to notify us when
++ * it's done, so that we can wait interruptibly to finish, and so that
++ * we're not trying to locally do work that might fail after foreign
++ * transaction are committed.
++ *
++ * The best performing way to manage the waiting backends is to have a
++ * queue of waiting backends, so that we can avoid searching the through all
++ * foreign transactions each time we receive a request.  We have one queue
++ * of which elements are ordered by the timestamp when they expect to be
++ * processed.  Before waiting for foreign transactions being resolved the
++ * backend enqueues with the timestamp when they expects to be processed.
++ * On failure, it enqueues again with new timestamp (last timestamp +
++ * foreign_xact_resolution_interval).
++ *
++ * If server crash occurs or user canceled waiting the prepared foreign
++ * transactions are left without a holder.	Such foreign transactions are
++ * resolved automatically by the resolver process.
++ *
++ * Two-phase commit protocol is crash-safe.  We WAL logs the foreign transaction
++ * information.
++ *
++ * LOCKING
++ *
++ * Whenever a foreign transaction is processed, the corresponding FdwXact
++ * entry is update.	 To avoid holding the lock during transaction processing
++ * which may take an unpredicatable time the in-memory data of foreign
++ * transaction follows a locking model based on the following linked concepts:
++ *
++ * * All FdwXact fields except for status are protected by FdwXactLock. The
++ *	 status is protected by its mutex.
++ * * A process who is going to process foreign transaction needs to set
++ *   locking_backend of the FdwXact entry to lock the entry, which prevents the entry from
++ *	 being updated and removed by concurrent processes.
++ *
++ * RECOVERY
++ *
++ * During replay WAL and replication FdwXactCtl also holds information about
++ * active prepared foreign transaction that haven't been moved to disk yet.
++ *
++ * Replay of fdwxact records happens by the following rules:
++ *
++ * * At the beginning of recovery, pg_fdwxacts is scanned once, filling FdwXact
++ *	 with entries marked with fdwxact->inredo and fdwxact->ondisk.	FdwXact file
++ *	 data older than the XID horizon of the redo position are discarded.
++ * * On PREPARE redo, the foreign transaction is added to FdwXactCtl->fdwxacts.
++ *	 We set fdwxact->inredo to true for such entries.
++ * * On Checkpoint we iterate through FdwXactCtl->fdwxacts entries that
++ *	 have fdwxact->inredo set and are behind the redo_horizon.	We save
++ *	 them to disk and then set fdwxact->ondisk to true.
++ * * On resolution we delete the entry from FdwXactCtl->fdwxacts.  If
++ *	 fdwxact->ondisk is true, the corresponding entry from the disk is
++ *	 additionally deleted.
++ * * RecoverFdwXacts() and PrescanFdwXacts() have been modified to go through
++ *	 fdwxact->inredo entries that have not made it to disk.
++ *
++ * These replay rules are borrowed from twophase.c
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/backend/access/fdwxact/fdwxact.c
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "access/fdwxact.h"
++//#include "access/fdwxact_resolver.h"
++#include "access/fdwxact_launcher.h"
++#include "access/twophase.h"
++//#include "access/resolver_internal.h"
++#include "access/xact.h"
++#include "access/xlog.h"
++//#include "access/csn_log.h"
++#include "access/xloginsert.h"
++#include "access/xlogutils.h"
++#include "foreign/fdwapi.h"
++#include "foreign/foreign.h"
++#include "funcapi.h"
++#include "miscadmin.h"
++#include "pgstat.h"
++#include "storage/ipc.h"
++#include "storage/latch.h"
++#include "storage/lock.h"
++#include "storage/pmsignal.h"
++#include "storage/procarray.h"
++#include "tcop/tcopprot.h"
++#include "utils/builtins.h"
++#include "utils/guc.h"
++#include "utils/memutils.h"
++#include "utils/rel.h"
++#include "utils/ps_status.h"
++
++/* Foreign twophase commit is enabled and requested by user */
++#define IsForeignTwophaseCommitRequested() \
++	 (foreign_twophase_commit > FOREIGN_TWOPHASE_COMMIT_DISABLED)
++/* Check the FdwXactParticipant is capable of two-phase commit  */
++#define ServerSupportTransactionCallback(fdw_part) \
++	(((FdwXactParticipant *)(fdw_part))->commit_foreign_xact_fn != NULL)
++#define ServerSupportTwophaseCommit(fdw_part) \
++	(((FdwXactParticipant *)(fdw_part))->prepare_foreign_xact_fn != NULL)
++#define SeverSupportGlobalSnapshots(fdw_part) \
++(((FdwXactParticipant *)(fdw_part))->prepare_foreign_CSN_snapshot_fn != NULL)
++
++/* Directory where the foreign prepared transaction files will reside */
++#define FDWXACTS_DIR "pg_fdwxact"
++
++/*
++ * Name of foreign prepared transaction file is 8 bytes database oid,
++ * xid, foreign server oid and user oid separated by '_'.
++ *
++ * Since FdwXact stat file is created per foreign transaction in a
++ * distributed transaction and the xid of unresolved distributed
++ * transaction never reused, the name is fairly enough to ensure
++ * uniqueness.
++ */
++#define FDWXACT_FILE_NAME_LEN (8 + 1 + 8 + 1 + 8 + 1 + 8)
++#define FdwXactFilePath(path, dbid, xid, serverid, userid)	\
++	snprintf(path, MAXPGPATH, FDWXACTS_DIR "/%08X_%08X_%08X_%08X", \
++			 dbid, xid, serverid, userid)
++
++/*
++ * Structure to bundle the foreign transaction participant.	 This struct
++ * needs to live until the end of transaction where we cannot look at
++ * syscachees. Therefore, this is allocated in the TopTransactionContext.
++ */
++typedef struct FdwXactParticipant
++{
++	/*
++	 * Pointer to a FdwXact entry in the global array. NULL if the entry is
++	 * not inserted yet but this is registered as a participant.
++	 */
++	FdwXact		fdwxact;
++
++	/* Foreign server and user mapping info, passed to callback routines */
++	ForeignServer *server;
++	UserMapping *usermapping;
++
++	/* Transaction identifier used for PREPARE */
++	char	   *fdwxact_id;
++
++	/* true if modified the data on the server */
++	bool		modified;
++
++	/* c.huang */
++	FdwXactStatus status;
++	bool 		isEnded;
++	TransactionId xid;
++
++	/* Callbacks for foreign transaction */
++	CommitForeignTransaction_function commit_foreign_xact_fn;
++	RollbackForeignTransaction_function rollback_foreign_xact_fn;
++	PrepareForeignTransaction_function prepare_foreign_xact_fn;
++	GetPrepareId_function get_prepareid_fn;
++} FdwXactParticipant;
++
++/*
++ * List of foreign transactions involved in the transaction.  A member of
++ * participants must support both commit and rollback APIs.
++
++ * FdwXactParticipants_tmp is used to update FdwXactParticipants atomically
++ * when executing COMMIT/ROLLBACK PREPARED command.	 In COMMIT PREPARED case,
++ * we don't want to rollback foreign transactions even if an error occurs,
++ * because the local prepared transaction never turn over rollback in that
++ * case.  However, preparing FdwXactParticipants might be lead an error
++ * because of calling palloc() inside.	So we prepare FdwXactParticipants in
++ * two phase.  In the first phase, CollectFdwXactParticipants(), we collect
++ * all foreign transactions associated with the local prepared transactions
++ * and kept them in FdwXactParticipants_tmp.  Even if an error occurs during
++ * that, we don't rollback them.  In the second phase, SetFdwXactParticipants(),
++ * we replace FdwXactParticipants_tmp with FdwXactParticipants and hold them.
++ *
++ */
++static List *FdwXactParticipants = NIL;
++
++/*
++ * FdwXactLocalXid is the local transaction id associated with FdwXactParticipants.
++ * ForeignTwophaseCommitIsRequired is true if the current transaction needs to
++ * be committed together with foreign servers.
++ */
++static TransactionId FdwXactLocalXid = InvalidTransactionId;
++static bool ForeignTwophaseCommitIsRequired = false;
++
++/* Guc parameter */
++int			max_prepared_foreign_xacts = 0;
++int			foreign_twophase_commit = FOREIGN_TWOPHASE_COMMIT_DISABLED;
++bool		fdw_xact_self_resolve = false;
++bool		global_deadlock_detect_enable = false;
++
++static void FdwXactPrepareForeignTransactions(bool prepare_all);
++static void FdwXactParticipantEndTransaction(FdwXactParticipant *fdw_part,
++											 bool commit);
++static char *ReadFdwXactFile(Oid dbid, TransactionId xid, Oid serverid, Oid userid);
++static void RemoveFdwXactFile(Oid dbid, TransactionId xid, Oid serverid, Oid userid,
++							  bool giveWarning);
++static bool checkForeignTwophaseCommitRequired(bool local_modified);
++static FdwXactParticipant *create_fdwxact_participant(Oid serverid, Oid userid,
++													  FdwRoutine *routine);
++static char *get_fdwxact_identifier(FdwXactParticipant *fdw_part,
++									TransactionId xid);
++static void FdwXactParticipantEndTransaction2PC(FdwXactParticipant *fdw_part, bool commit);
++static int FdwXactRegisterGTM(const char * fdwxact_id);
++int FdwXactDeregisterGTM(const char * fdwxact_id);
++static int FdwXactPersistFdwXactEntry(TransactionId xid, FdwXactParticipant *fdw_part);
++static char * get_cnxid_identifier(TransactionId xid);
++
++TimestampTz fdw_xact_gtm_last_timer;
++int gtm_check_required = 0;
++
++/* Entry point for FdwXact GTM routines */
++FdwXactLibpqFuncs * fdwXactLibpqFuncs = NULL;
++
++/*
++ * Register the given foreign transaction identified by the given arguments
++ * as a participant of the transaction.
++ */
++void
++FdwXactRegisterXact(Oid serverid, Oid userid, bool modified)
++{
++	FdwXactParticipant *fdw_part;
++	MemoryContext old_ctx;
++	FdwRoutine *routine;
++	ListCell   *lc;
++
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++
++		if (fdw_part->server->serverid == serverid &&
++			fdw_part->usermapping->userid == userid)
++		{
++			/* Already registered */
++			fdw_part->modified |= modified;
++			return;
++		}
++	}
++
++	routine = GetFdwRoutineByServerId(serverid);
++
++	/* Foreign server must implement both callback */
++	if (!(routine->CommitForeignTransaction && routine->RollbackForeignTransaction))
++		ereport(ERROR,
++				(errmsg("cannot register foreign server not supporting both commit and rollback callbacks")));
++
++	/*
++	 * Participant's information is also used at the end of a transaction,
++	 * where system cache are not available. Save it in TopTransactionContext
++	 * so that these can live until the end of transaction.
++	 */
++	old_ctx = MemoryContextSwitchTo(TopTransactionContext);
++
++	fdw_part = create_fdwxact_participant(serverid, userid, routine);
++	fdw_part->modified = modified;
++
++	/* Add to the participants list */
++	FdwXactParticipants = lappend(FdwXactParticipants, fdw_part);
++
++	/* Revert back the context */
++	MemoryContextSwitchTo(old_ctx);
++}
++
++/* Remove the given foreign server from FdwXactParticipants */
++void
++FdwXactUnregisterXact(Oid serverid, Oid userid)
++{
++	ListCell   *lc;
++
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++
++		if (fdw_part->server->serverid == serverid &&
++			fdw_part->usermapping->userid == userid)
++		{
++			/* Remove the entry */
++			FdwXactParticipants =
++				foreach_delete_current(FdwXactParticipants, lc);
++			break;
++		}
++	}
++}
++
++/* Return palloc'd FdwXactParticipant variable */
++static FdwXactParticipant *
++create_fdwxact_participant(Oid serverid, Oid userid, FdwRoutine *routine)
++{
++	FdwXactParticipant *fdw_part;
++	ForeignServer *foreign_server;
++	UserMapping *user_mapping;
++
++	foreign_server = GetForeignServer(serverid);
++	user_mapping = GetUserMapping(userid, serverid);
++
++	fdw_part = (FdwXactParticipant *) palloc(sizeof(FdwXactParticipant));
++
++	fdw_part->fdwxact = NULL;
++	fdw_part->server = foreign_server;
++	fdw_part->usermapping = user_mapping;
++	fdw_part->fdwxact_id = NULL;
++	fdw_part->modified = false;
++	fdw_part->commit_foreign_xact_fn = routine->CommitForeignTransaction;
++	fdw_part->rollback_foreign_xact_fn = routine->RollbackForeignTransaction;
++	fdw_part->prepare_foreign_xact_fn = routine->PrepareForeignTransaction;
++	fdw_part->get_prepareid_fn = routine->GetPrepareId;
++
++	/* c.huang */
++	fdw_part->status = FDWXACT_STATUS_INVALID;
++
++	return fdw_part;
++}
++
++/*
++ * Prepare all foreign transactions if foreign twophase commit is required.
++ * When foreign twophase commit is enabled, the behavior depends on the value
++ * of foreign_twophase_commit; when 'required' we strictly require for all
++ * foreign servers' FDW to support two-phase commit protocol and ask them to
++ * prepare foreign transactions, and when 'disabled' we ask all foreign servers
++ * to commit foreign transaction in one-phase. If we failed to commit any of
++ * them we change to aborting.
++ *
++ * Note that non-modified foreign servers always can be committed without
++ * preparation.
++ */
++void
++PreCommit_FdwXact(void)
++{
++	TransactionId xid;
++	ListCell   *lc;
++	bool		local_modified;
++
++	/* If there are no foreign servers involved, we have no business here */
++	if (FdwXactParticipants == NIL)
++		return;
++
++	Assert(!RecoveryInProgress());
++
++	/*
++	 * Check if the current transaction did writes.	 We need to include the
++	 * local node to the distributed transaction participant and to regard it
++	 * as modified, if the current transaction has performed WAL logging and
++	 * has assigned an xid.	 The transaction can end up not writing any WAL,
++	 * even if it has an xid, if it only wrote to temporary and/or unlogged
++	 * tables.	It can end up having written WAL without an xid if did HOT
++	 * pruning.
++	 */
++	xid = GetTopTransactionIdIfAny();
++	local_modified = (TransactionIdIsValid(xid) && (XactLastRecEnd != 0));
++
++	/*
++	 * Check if we need to use foreign twophase commit. Note that we don't
++	 * support foreign twophase commit in single user mode.
++	 */
++	if (IsUnderPostmaster && checkForeignTwophaseCommitRequired(local_modified))
++	{
++		/*
++		 * We need to use two-phase commit.	 Assign a transaction id to the
++		 * current transaction if not yet. Then prepare foreign transactions
++		 * on foreign servers that support two-phase commit.  Note that we
++		 * keep FdwXactParticipants until the end of the transaction.
++		 */
++		FdwXactLocalXid = xid;
++		if (!TransactionIdIsValid(FdwXactLocalXid))
++			FdwXactLocalXid = GetTopTransactionId();
++
++		FdwXactPrepareForeignTransactions(false);
++	}
++	else
++	{
++		/*
++		 * Two-phase commit is not required. Commit foreign transactions in
++		 * the participant list.
++		 */
++		foreach(lc, FdwXactParticipants)
++		{
++			FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++
++			Assert(!fdw_part->fdwxact);
++
++			elog(DEBUG2, "%s: COMMIT participant %s", __FUNCTION__, fdw_part->server->servername);
++			/* Commit the foreign transaction in one-phase */
++			if (ServerSupportTransactionCallback(fdw_part))
++				FdwXactParticipantEndTransaction(fdw_part, true);
++		}
++
++		/* All participants' transactions should be completed at this time */
++		ForgetAllFdwXactParticipants();
++	}
++}
++
++/*
++ * Return true if the current transaction modifies data on two or more servers
++ * in FdwXactParticipants and local server itself.
++ */
++static bool
++checkForeignTwophaseCommitRequired(bool local_modified)
++{
++	ListCell   *lc;
++	bool		have_notwophase = false;
++	int			nserverswritten = 0;
++
++	if (!IsForeignTwophaseCommitRequested())
++		return false;
++
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++
++		if (!fdw_part->modified)
++			continue;
++
++		if (!ServerSupportTwophaseCommit(fdw_part))
++			have_notwophase = true;
++
++		nserverswritten++;
++	}
++
++	/* Did we modify the local non-temporary data? */
++	if (local_modified)
++		nserverswritten++;
++
++	/*
++	 * Two-phase commit is not required if the number of servers performed
++	 * writes is less than 2.
++	 * writes is less than 2 and global snapshots are disabled,
++	 * In case of global transactions we requirs only one remote server to have
++	 * performed the write operation to start 2PC
++	 */
++	if (nserverswritten < 2)
++		return false;
++
++	Assert(foreign_twophase_commit == FOREIGN_TWOPHASE_COMMIT_REQUIRED);
++
++	/* Two-phase commit is required. Check parameters */
++	if (max_prepared_foreign_xacts == 0)
++		ereport(ERROR,
++				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++				 errmsg("foreign two-phase commit is required but prepared foreign transactions are disabled"),
++				 errhint("Set max_prepared_foreign_transactions to a nonzero value.")));
++
++	if (have_notwophase)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("cannot process a distributed transaction that has operated on a foreign server that does not support two-phase commit protocol"),
++				 errdetail("foreign_twophase_commit is \'required\' but the transaction has some foreign servers which are not capable of two-phase commit")));
++
++	return true;
++}
++
++/*
++ * Insert FdwXact entries and prepare foreign transactions.  If prepare_all is
++ * true, we prepare all foreign transaction regardless of writes having happened
++ * on the server.
++ *
++ * We still can change to rollback here on failure. If any error occurs, we
++ * rollback non-prepared foreign transactions.
++ */
++static void
++FdwXactPrepareForeignTransactions(bool prepare_all)
++{
++	ListCell   *lc;
++
++	if (FdwXactParticipants == NIL)
++		return;
++
++	Assert(TransactionIdIsValid(FdwXactLocalXid));
++
++	/* Loop over the foreign connections */
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++		FdwXactRslvState state;
++
++		CHECK_FOR_INTERRUPTS();
++
++		/* Skip if the server's FDW doesn't support two-phase commit */
++		if (!ServerSupportTwophaseCommit(fdw_part))
++			continue;
++
++		if (!prepare_all && !fdw_part->modified)
++			continue;
++
++		fdw_part->xid = FdwXactLocalXid;
++		/* Get prepared transaction identifier */
++//		fdw_part->fdwxact_id = get_fdwxact_identifier(fdw_part, FdwXactLocalXid);
++		fdw_part->fdwxact_id = get_cnxid_identifier(FdwXactLocalXid);
++		Assert(fdw_part->fdwxact_id);
++
++		/*
++		 * Insert the foreign transaction entry with the
++		 * FDWXACT_STATUS_PREPARING status. Registration persists this
++		 * information to the disk and logs (that way relaying it on standby).
++		 * Thus in case we loose connectivity to the foreign server or crash
++		 * ourselves, we will remember that we might have prepared transaction
++		 * on the foreign server and try to resolve it when connectivity is
++		 * restored or after crash recovery.
++		 *
++		 * If we prepare the transaction on the foreign server before
++		 * persisting the information to the disk and crash in-between these
++		 * two steps, we will lost the prepared transaction on the foreign
++		 * server and will not be able to resolve it after the crash recovery.
++		 * Hence persist first then prepare.
++		 */
++//		FdwXactPersistFdwXactEntry(FdwXactLocalXid, fdw_part);
++
++		/*
++		 * Prepare the foreign transaction.
++		 *
++		 * Between FdwXactInsertFdwXactEntry call till this backend hears
++		 * acknowledge from foreign server, the backend may abort the local
++		 * transaction (say, because of a signal).
++		 */
++		state.xid = FdwXactLocalXid;
++		state.server = fdw_part->server;
++		state.usermapping = fdw_part->usermapping;
++		state.fdwxact_id = fdw_part->fdwxact_id;
++		fdw_part->prepare_foreign_xact_fn(&state);
++
++		/* succeeded, update status */
++		fdw_part->status = FDWXACT_STATUS_PREPARED;
++
++		// c.huang start marking this flag as true as soon as we have a prepared statement
++		ForeignTwophaseCommitIsRequired = true;
++	}
++
++	/* c.huang: if we reach here, that means all of the participants have been prepared
++	 * successfully. If one of them failed, PG will jump to abort sequence and will
++	 * not reach here. Register 1 entry at GTM after all participants prepared successfully
++	 */
++	char * cnxid = get_cnxid_identifier(FdwXactLocalXid);
++
++	if (FdwXactRegisterGTM(cnxid) != 0)
++		elog(WARNING, "Failed to register current CN transaction to GTM");
++	else
++		elog(WARNING, "Successfully registered current CN transaction to GTM");
++
++	pfree(cnxid);
++}
++
++/*
++ * Return a null-terminated foreign transaction identifier.  If the given
++ * foreign server's FDW provides getPrepareId callback we return the identifier
++ * returned from it. Otherwise we generate an unique identifier with in the
++ * form of "fx_<random number>_<xid>_<serverid>_<userid> whose length is
++ * less than FDWXACT_ID_MAX_LEN.
++ *
++ * Returned string value is used to identify foreign transaction. The
++ * identifier should not be same as any other concurrent prepared transaction
++ * identifier.
++ *
++ * To make the foreign transactionid unique, we should ideally use something
++ * like UUID, which gives unique ids with high probability, but that may be
++ * expensive here and UUID extension which provides the function to generate
++ * UUID is not part of the core code.
++ */
++static char *
++get_fdwxact_identifier(FdwXactParticipant *fdw_part, TransactionId xid)
++{
++	char	   *id;
++	int			id_len = 0;
++
++	/*
++	 * If FDW doesn't provide the callback function, generate an unique
++	 * identifier.
++	 */
++	if (!fdw_part->get_prepareid_fn)
++	{
++		char		buf[FDWXACT_ID_MAX_LEN] = {0};
++
++		snprintf(buf, FDWXACT_ID_MAX_LEN, "fx_%ld_%u_%d_%d",
++				 Abs(random()), xid, fdw_part->server->serverid,
++				 fdw_part->usermapping->userid);
++
++		return pstrdup(buf);
++	}
++
++	/* Get an unique identifier from callback function */
++	id = fdw_part->get_prepareid_fn(xid, fdw_part->server->serverid,
++									fdw_part->usermapping->userid,
++									&id_len);
++
++	if (id == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 (errmsg("foreign transaction identifier is not provided"))));
++
++	/* Check length of foreign transaction identifier */
++	if (id_len > FDWXACT_ID_MAX_LEN)
++	{
++		id[FDWXACT_ID_MAX_LEN] = '\0';
++		ereport(ERROR,
++				(errcode(ERRCODE_NAME_TOO_LONG),
++				 errmsg("foreign transaction identifier \"%s\" is too long",
++						id),
++				 errdetail("Foreign transaction identifier must be less than %d characters.",
++						   FDWXACT_ID_MAX_LEN)));
++	}
++
++	id[id_len] = '\0';
++	return pstrdup(id);
++}
++
++static char *
++get_cnxid_identifier(TransactionId xid)
++{
++	char		buf[FDWXACT_ID_MAX_LEN] = {0};
++	snprintf(buf, FDWXACT_ID_MAX_LEN, "_fx_%s_%u",
++			 cluster_name, xid);
++
++	return pstrdup(buf);
++}
++
++/*
++ * The routine for committing or rolling back the given transaction participant.
++ */
++static void
++FdwXactParticipantEndTransaction(FdwXactParticipant *fdw_part, bool commit)
++{
++	FdwXactRslvState state;
++
++	Assert(ServerSupportTransactionCallback(fdw_part));
++
++	state.xid = FdwXactLocalXid;
++	state.server = fdw_part->server;
++	state.usermapping = fdw_part->usermapping;
++	state.fdwxact_id = NULL;
++	state.flags = FDWXACT_FLAG_ONEPHASE;
++	if (commit)
++	{
++		fdw_part->commit_foreign_xact_fn(&state);
++		elog(DEBUG1, "successfully committed the foreign transaction for server %u user %u",
++			 fdw_part->usermapping->serverid,
++			 fdw_part->usermapping->userid);
++	}
++	else
++	{
++		fdw_part->rollback_foreign_xact_fn(&state);
++		elog(DEBUG1, "successfully rolled back the foreign transaction for server %u user %u",
++			 fdw_part->usermapping->serverid,
++			 fdw_part->usermapping->userid);
++	}
++}
++
++/*
++ * The routine for committing or rolling back the given transaction participant.
++ */
++static void
++FdwXactParticipantEndTransaction2PC(FdwXactParticipant *fdw_part, bool commit)
++{
++	FdwXactRslvState state;
++
++	Assert(ServerSupportTransactionCallback(fdw_part));
++
++	state.xid = FdwXactLocalXid;
++	state.server = fdw_part->server;
++	state.usermapping = fdw_part->usermapping;
++	state.fdwxact_id = fdw_part->fdwxact_id;
++	state.flags = 0;
++	if (commit)
++	{
++		fdw_part->commit_foreign_xact_fn(&state);
++		elog(DEBUG1, "successfully committed the foreign transaction for server %u user %u",
++			 fdw_part->usermapping->serverid,
++			 fdw_part->usermapping->userid);
++	}
++	else
++	{
++		fdw_part->rollback_foreign_xact_fn(&state);
++		elog(DEBUG1, "successfully rolled back the foreign transaction for server %u user %u",
++			 fdw_part->usermapping->serverid,
++			 fdw_part->usermapping->userid);
++	}
++	fdw_part->isEnded = state.isEnded;
++}
++
++
++/*
++ * Unlock foreign transaction participants and clear the FdwXactParticipants
++ * list.  If we left foreign transaction, update the oldest xmin of unresolved
++ * transaction so that local transaction id of such unresolved foreign transaction
++ * is not truncated.
++ */
++void
++ForgetAllFdwXactParticipants(void)
++{
++	if (FdwXactParticipants == NIL)
++	{
++		Assert(!ForeignTwophaseCommitIsRequired);
++		return;
++	}
++
++	list_free_deep(FdwXactParticipants);
++	FdwXactParticipants = NIL;
++	ForeignTwophaseCommitIsRequired = false;
++}
++
++/*
++ * Commit or rollback all foreign transactions.
++ */
++void
++AtEOXact_FdwXact(bool is_commit)
++{
++	ListCell   *lc;
++	bool hasFailure = false;
++
++	/* If there are no foreign servers involved, we have no business here */
++	if (FdwXactParticipants == NIL)
++		return;
++
++	Assert(!RecoveryInProgress());
++
++	/* Commit or rollback foreign transactions in the participant list */
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++		int			status;
++
++		/* c.huang: if we are doing rollback 2PC with a valid
++		 * 2PC ID, but the status says it is not prepared, this means
++		 * foreign server may not have started 2PC yet. Rollback as
++		 * a regular transaction
++		 */
++		if (ForeignTwophaseCommitIsRequired && !is_commit &&
++				fdw_part->status != FDWXACT_STATUS_PREPARED)
++		{
++			elog(WARNING, "%s: special case: 1P rollback server %s because it"
++					"may not have succeeded in prepare transaction.",
++					__FUNCTION__, fdw_part->server->servername);
++
++			Assert(ServerSupportTransactionCallback(fdw_part));
++			FdwXactParticipantEndTransaction(fdw_part, is_commit);
++
++//			RemoveFdwXactFile(MyDatabaseId, fdw_part->xid,
++//					fdw_part->server->serverid, fdw_part->usermapping->userid,
++//					false);
++
++			continue;
++		}
++
++		/* Commit or rollback the foreign transaction in two-phase */
++		if (ForeignTwophaseCommitIsRequired)
++		{
++			/* Commit or rollback the foreign transaction in two-phase */
++			Assert(ServerSupportTransactionCallback(fdw_part));
++			FdwXactParticipantEndTransaction2PC(fdw_part, is_commit);
++
++			if (fdw_part->isEnded)
++			{
++//				RemoveFdwXactFile(MyDatabaseId, fdw_part->xid,
++//						fdw_part->server->serverid, fdw_part->usermapping->userid,
++//						true);
++			}
++			else
++			{
++				/* if isEnded is not set to true, then COMMIT / ROLLBACK prepared
++				 * must have failed. Set hasFailure to true
++				 */
++				hasFailure = true;
++			}
++			continue;
++		}
++		else
++		{
++			/* Commit or rollback the foreign transaction in one-phase */
++			Assert(ServerSupportTransactionCallback(fdw_part));
++			FdwXactParticipantEndTransaction(fdw_part, is_commit);
++			continue;
++		}
++
++
++		/*
++		 * We never reach here in commit case since all foreign transaction
++		 * should be committed in that case.
++		 */
++		Assert(!is_commit);
++
++		/*
++		 * Abort the foreign transaction.  For participants whose status is
++		 * FDWXACT_STATUS_PREPARING, we close the transaction in one-phase. In
++		 * addition, since we are not sure that the preparation has been
++		 * completed on the foreign server, we also attempts to rollback the
++		 * prepared foreign transaction.  Note that it's FDWs responsibility
++		 * that they tolerate OBJECT_NOT_FOUND error in abort case.
++		 */
++		if (status == FDWXACT_STATUS_PREPARING)
++			FdwXactParticipantEndTransaction(fdw_part, false);
++	}
++
++	/* c.huang: highgo GTM deregister remote transaction here only if
++	 * the 2PC is ended successfully - TODO: This may not be required
++	 */
++	if (!hasFailure)
++	{
++		char * cnxid = get_cnxid_identifier(FdwXactLocalXid);
++
++		if (FdwXactDeregisterGTM(cnxid) != 0)
++			elog(WARNING, "Failed to deregister current CN transaction to GTM");
++		else
++			elog(WARNING, "Successfully deregistered current CN transaction to GTM");
++
++		pfree(cnxid);
++	}
++	ForgetAllFdwXactParticipants();
++}
++
++/*
++ * Prepare foreign transactions by PREPARE TRANSACTION command.
++ *
++ * Note that it's possible that the transaction aborts after we prepared some
++ * of participants. In this case we change to rollback and rollback all foreign
++ * transactions.
++ */
++void
++PrePrepare_FdwXact(void)
++{
++	ListCell   *lc;
++
++	if (FdwXactParticipants == NIL)
++		return;
++
++	/*
++	 * Check if there is a server that doesn't support two-phase commit. All
++	 * involved servers need to support two-phase commit as we prepare on them
++	 * regardless of modified or not.
++	 */
++	foreach(lc, FdwXactParticipants)
++	{
++		FdwXactParticipant *fdw_part = (FdwXactParticipant *) lfirst(lc);
++
++		if (!ServerSupportTwophaseCommit(fdw_part))
++			ereport(ERROR,
++					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++					 errmsg("cannot PREPARE a distributed transaction which has operated on a foreign server not supporting two-phase commit protocol")));
++	}
++
++	/* Set the local transaction id */
++	FdwXactLocalXid = GetTopTransactionId();
++
++	/* Prepare transactions on participating foreign servers */
++	FdwXactPrepareForeignTransactions(true);
++}
++
++/*
++ * After PREPARE TRANSACTION, we forget all participants.
++ */
++void
++PostPrepare_FdwXact(void)
++{
++	ForgetAllFdwXactParticipants();
++}
++
++/*
++ * This function is used to create new foreign transaction entry before an FDW
++ * prepares and commit/rollback. The function adds the entry to WAL and it will
++ * be persisted to the disk under pg_fdwxact directory when checkpoint.
++ */
++static int
++FdwXactPersistFdwXactEntry(TransactionId xid, FdwXactParticipant *fdw_part)
++{
++	FdwXactOnDiskData *fdwxact_file_data;
++	int			data_len;
++
++	/*
++	 * Prepare to write the entry to a file. Also add xlog entry. The contents
++	 * of the xlog record are same as what is written to the file.
++	 */
++	data_len = offsetof(FdwXactOnDiskData, fdwxact_id);
++	data_len = data_len + strlen(fdw_part->fdwxact_id) + 1;
++	data_len = MAXALIGN(data_len);
++	fdwxact_file_data = (FdwXactOnDiskData *) palloc0(data_len);
++	fdwxact_file_data->dbid = MyDatabaseId;
++	fdwxact_file_data->local_xid = xid;
++	fdwxact_file_data->serverid = fdw_part->server->serverid;
++	fdwxact_file_data->userid = fdw_part->usermapping->userid;
++	fdwxact_file_data->umid = fdw_part->usermapping->umid;
++	memset(fdwxact_file_data->fdwxact_id, 0, FDWXACT_ID_MAX_LEN);
++	memcpy(fdwxact_file_data->fdwxact_id, fdw_part->fdwxact_id,
++		   strlen(fdw_part->fdwxact_id) + 1);
++
++	RecreateFdwXactFile(fdwxact_file_data->dbid, fdwxact_file_data->local_xid,
++			fdwxact_file_data->serverid, fdwxact_file_data->userid, fdwxact_file_data, data_len);
++
++	pfree(fdwxact_file_data);
++	return 0;
++}
++
++/*
++ * Recreates a foreign transaction state file. This is used in WAL replay
++ * and during checkpoint creation.
++ *
++ * Note: content and len don't include CRC.
++ */
++void
++RecreateFdwXactFile(Oid dbid, TransactionId xid, Oid serverid,
++					Oid userid, void *content, int len)
++{
++	char		path[MAXPGPATH];
++	pg_crc32c	statefile_crc;
++	int			fd;
++
++	/* Recompute CRC */
++	INIT_CRC32C(statefile_crc);
++	COMP_CRC32C(statefile_crc, content, len);
++	FIN_CRC32C(statefile_crc);
++
++	FdwXactFilePath(path, dbid, xid, serverid, userid);
++
++	fd = OpenTransientFile(path, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
++
++	if (fd < 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not recreate foreign transaction state file \"%s\": %m",
++						path)));
++
++	/* Write content and CRC */
++//	pgstat_report_wait_start(WAIT_EVENT_FDWXACT_FILE_WRITE);
++	if (write(fd, content, len) != len)
++	{
++		/* if write didn't set errno, assume problem is no disk space */
++		if (errno == 0)
++			errno = ENOSPC;
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not write foreign transaction state file: %m")));
++	}
++	if (write(fd, &statefile_crc, sizeof(pg_crc32c)) != sizeof(pg_crc32c))
++	{
++		if (errno == 0)
++			errno = ENOSPC;
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not write foreign transaction state file: %m")));
++	}
++	pgstat_report_wait_end();
++
++	/*
++	 * We must fsync the file because the end-of-replay checkpoint will not do
++	 * so, there being no FDWXACT in shared memory yet to tell it to.
++	 */
++//	pgstat_report_wait_start(WAIT_EVENT_FDWXACT_FILE_SYNC);
++	if (pg_fsync(fd) != 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not fsync foreign transaction state file: %m")));
++	pgstat_report_wait_end();
++
++	if (CloseTransientFile(fd) != 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not close foreign transaction file: %m")));
++}
++
++int
++RestoreFdwXactDataByXid(TransactionId xid)
++{
++	DIR		   *cldir;
++	struct dirent *clde;
++	char	   *buf;
++	int 		restoreCount = 0;
++
++	cldir = AllocateDir(FDWXACTS_DIR);
++	while ((clde = ReadDir(cldir, FDWXACTS_DIR)) != NULL)
++	{
++		if (strlen(clde->d_name) == FDWXACT_FILE_NAME_LEN &&
++			strspn(clde->d_name, "0123456789ABCDEF_") == FDWXACT_FILE_NAME_LEN)
++		{
++			TransactionId local_xid;
++			Oid			dbid;
++			Oid			serverid;
++			Oid			userid;
++			char	   *buf;
++
++			sscanf(clde->d_name, "%08x_%08x_%08x_%08x",
++				   &dbid, &local_xid, &serverid, &userid);
++
++			/* Read fdwxact data from disk */
++			if (dbid == MyDatabaseId && local_xid == xid)
++			{
++				MemoryContext old_ctx;
++				FdwXactParticipant *fdw_part;
++				FdwXactOnDiskData *fdwxact_file_data;
++				FdwRoutine *routine;
++
++				/* this fdwxact is related to given xid and needs to be loaded */
++				elog(WARNING, "loading fdwxact file %s", clde->d_name);
++				buf = ReadFdwXactFile(dbid, xid, serverid, userid);
++				fdwxact_file_data = (FdwXactOnDiskData *) buf;
++
++				routine = GetFdwRoutineByServerId(fdwxact_file_data->serverid);
++
++				old_ctx = MemoryContextSwitchTo(TopTransactionContext);
++
++				Assert(FdwXactParticipants == NIL);
++
++				fdw_part = create_fdwxact_participant(fdwxact_file_data->serverid,
++						fdwxact_file_data->userid, routine);
++
++				fdw_part->modified = true;
++				fdw_part->fdwxact_id = pstrdup(fdwxact_file_data->fdwxact_id);
++				fdw_part->xid = fdwxact_file_data->local_xid;
++
++				/* Add to the participants list */
++				FdwXactParticipants = lappend(FdwXactParticipants, fdw_part);
++
++				MemoryContextSwitchTo(old_ctx);
++				restoreCount++;
++			}
++		}
++	}
++
++	FreeDir(cldir);
++	return restoreCount;
++}
++
++/*
++ * Read and validate the foreign transaction state file.
++ *
++ * If it looks OK (has a valid magic number and CRC), return the palloc'd
++ * contents of the file, issuing an error when finding corrupted data.
++ * This state can be reached when doing recovery.
++ */
++static char *
++ReadFdwXactFile(Oid dbid, TransactionId xid, Oid serverid, Oid userid)
++{
++	char		path[MAXPGPATH];
++	int			fd;
++	FdwXactOnDiskData *fdwxact_file_data;
++	struct stat stat;
++	uint32		crc_offset;
++	pg_crc32c	calc_crc;
++	pg_crc32c	file_crc;
++	char	   *buf;
++	int			r;
++
++	FdwXactFilePath(path, dbid, xid, serverid, userid);
++
++	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
++	if (fd < 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not open FDW transaction state file \"%s\": %m",
++						path)));
++
++	/*
++	 * Check file length.  We can determine a lower bound pretty easily. We
++	 * set an upper bound to avoid palloc() failure on a corrupt file, though
++	 * we can't guarantee that we won't get an out of memory error anyway,
++	 * even on a valid file.
++	 */
++	if (fstat(fd, &stat))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not stat FDW transaction state file \"%s\": %m",
++						path)));
++
++	if (stat.st_size < (offsetof(FdwXactOnDiskData, fdwxact_id) +
++						sizeof(pg_crc32c)) ||
++		stat.st_size > MaxAllocSize)
++
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("too large FDW transaction state file \"%s\": %m",
++						path)));
++
++	crc_offset = stat.st_size - sizeof(pg_crc32c);
++	if (crc_offset != MAXALIGN(crc_offset))
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_CORRUPTED),
++				 errmsg("incorrect alignment of CRC offset for file \"%s\"",
++						path)));
++
++	/*
++	 * Ok, slurp in the file.
++	 */
++	buf = (char *) palloc(stat.st_size);
++	fdwxact_file_data = (FdwXactOnDiskData *) buf;
++
++	/* Slurp the file */
++//	pgstat_report_wait_start(WAIT_EVENT_FDWXACT_FILE_READ);
++	r = read(fd, buf, stat.st_size);
++	if (r != stat.st_size)
++	{
++		if (r < 0)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("could not read file \"%s\": %m", path)));
++		else
++			ereport(ERROR,
++					(errmsg("could not read file \"%s\": read %d of %zu",
++							path, r, (Size) stat.st_size)));
++	}
++//	pgstat_report_wait_end();
++
++	if (CloseTransientFile(fd))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("could not close file \"%s\": %m", path)));
++
++	/*
++	 * Check the CRC.
++	 */
++	INIT_CRC32C(calc_crc);
++	COMP_CRC32C(calc_crc, buf, crc_offset);
++	FIN_CRC32C(calc_crc);
++
++	file_crc = *((pg_crc32c *) (buf + crc_offset));
++
++	if (!EQ_CRC32C(calc_crc, file_crc))
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_CORRUPTED),
++				 errmsg("calculated CRC checksum does not match value stored in file \"%s\"",
++						path)));
++
++	/* Check if the contents is an expected data */
++	fdwxact_file_data = (FdwXactOnDiskData *) buf;
++	if (fdwxact_file_data->dbid != dbid ||
++		fdwxact_file_data->serverid != serverid ||
++		fdwxact_file_data->userid != userid ||
++		fdwxact_file_data->local_xid != xid)
++		ereport(ERROR,
++				(errcode(ERRCODE_DATA_CORRUPTED),
++				 errmsg("invalid foreign transaction state file \"%s\"",
++						path)));
++
++	return buf;
++}
++
++void
++FdwXactSet2PCRequired(void)
++{
++	ForeignTwophaseCommitIsRequired = true;
++}
++
++/*
++ * Remove the foreign transaction file for given entry.
++ *
++ * If giveWarning is false, do not complain about file-not-present;
++ * this is an expected case during WAL replay.
++ */
++static void
++RemoveFdwXactFile(Oid dbid, TransactionId xid, Oid serverid, Oid userid,
++				  bool giveWarning)
++{
++	char		path[MAXPGPATH];
++
++	FdwXactFilePath(path, dbid, xid, serverid, userid);
++	if (unlink(path) < 0 && (errno != ENOENT || giveWarning))
++		ereport(WARNING,
++				(errcode_for_file_access(),
++				 errmsg("could not remove foreign transaction state file \"%s\": %m",
++						path)));
++}
++
++static int FdwXactRegisterGTM(const char * cnxid)
++{
++	gtm_check_required = 1;
++	fdw_xact_gtm_last_timer = GetCurrentTimestamp();
++
++	if (fdwXactLibpqFuncs == NULL)
++		load_file("libpqfdwxact", false);
++
++	return (fdwXactLibpqFuncs->fdwxact_register_cn(cnxid));
++}
++
++int FdwXactDeregisterGTM(const char * cnxid)
++{
++	if (fdwXactLibpqFuncs == NULL)
++		load_file("libpqfdwxact", false);
++
++	return (fdwXactLibpqFuncs->fdwxact_deregister_cn(cnxid));
++}
++
++int FdwXactCheckGTM(const char * fdwxact_id)
++{
++	if (fdwXactLibpqFuncs == NULL)
++		load_file("libpqfdwxact", false);
++
++	return (fdwXactLibpqFuncs->fdwxact_query_registered_cn(fdwxact_id));
++}
++
++int GlobalDeadlockGTMCheckDN(const char * dn_id, const char * wait_str)
++{
++	if (fdwXactLibpqFuncs == NULL)
++		load_file("libpqfdwxact", false);
++
++	return (fdwXactLibpqFuncs->global_deadlock_check_dn(dn_id, wait_str));
++}
+diff --git a/src/backend/access/fdwxact/launcher.c b/src/backend/access/fdwxact/launcher.c
+new file mode 100644
+index 0000000000..8997368f62
+--- /dev/null
++++ b/src/backend/access/fdwxact/launcher.c
+@@ -0,0 +1,179 @@
++/*-------------------------------------------------------------------------
++ *
++ * launcher.c
++ *
++ * The foreign transaction resolver launcher process starts foreign
++ * transaction resolver processes. The launcher schedules resolver
++ * process to be started when arrived a requested by backend process.
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * IDENTIFICATION
++ *	  src/backend/access/fdwxact/launcher.c
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "funcapi.h"
++#include "pgstat.h"
++#include "funcapi.h"
++
++#include "access/fdwxact.h"
++#include "access/fdwxact_launcher.h"
++#include "access/twophase.h"
++#include "commands/dbcommands.h"
++#include "funcapi.h"
++#include "nodes/pg_list.h"
++#include "postmaster/bgworker.h"
++#include "storage/ipc.h"
++#include "storage/proc.h"
++#include "tcop/tcopprot.h"
++#include "utils/builtins.h"
++#include "access/fdwxact.h"
++
++
++int	fdw_xact_check_interval = 60; //60sec
++
++/* max sleep time between cycles (3min) */
++#define DEFAULT_NAPTIME_PER_CYCLE 180000L
++
++static void fdwxact_launcher_sighup(SIGNAL_ARGS);
++static void fdwxact_launcher_onexit(int code, Datum arg);
++
++
++static volatile sig_atomic_t got_SIGHUP = false;
++static volatile sig_atomic_t got_SIGUSR2 = false;
++
++
++/*
++ * Cleanup function for fdwxact launcher
++ *
++ * Called on fdwxact launcher exit.
++ */
++static void
++fdwxact_launcher_onexit(int code, Datum arg)
++{
++//	FdwXactRslvCtl->launcher_pid = InvalidPid;
++}
++
++/* SIGHUP: set flag to reload configuration at next convenient time */
++static void
++fdwxact_launcher_sighup(SIGNAL_ARGS)
++{
++	int			save_errno = errno;
++
++	got_SIGHUP = true;
++
++	SetLatch(MyLatch);
++
++	errno = save_errno;
++}
++
++/* SIGUSR2: set flag to launch new resolver process immediately */
++static void
++fdwxact_launcher_sigusr2(SIGNAL_ARGS)
++{
++	int			save_errno = errno;
++
++	got_SIGUSR2 = true;
++	SetLatch(MyLatch);
++
++	errno = save_errno;
++}
++
++/*
++ * Main loop for the fdwxact launcher process.
++ */
++void
++FdwXactLauncherMain(Datum main_arg)
++{
++	TimestampTz last_start_time = 0;
++
++	ereport(DEBUG2,
++			(errmsg("fdwxact resolver started")));
++
++	before_shmem_exit(fdwxact_launcher_onexit, (Datum) 0);
++
++	pqsignal(SIGHUP, fdwxact_launcher_sighup);
++	pqsignal(SIGUSR2, fdwxact_launcher_sigusr2);
++	pqsignal(SIGTERM, die);
++	BackgroundWorkerUnblockSignals();
++	BackgroundWorkerInitializeConnection(NULL, NULL, 0);
++
++	/* Enter main loop */
++	for (;;)
++	{
++		int			rc;
++		TimestampTz now = 0;
++		long		wait_time = DEFAULT_NAPTIME_PER_CYCLE;
++
++
++		CHECK_FOR_INTERRUPTS();
++		ResetLatch(MyLatch);
++
++		now = GetCurrentTimestamp();
++		if (TimestampDifferenceExceeds(last_start_time, now, (fdw_xact_check_interval * 1000)))
++		{
++			last_start_time = now;
++//			ereport(WARNING,
++//					(errmsg("%s: last check at %ld, interval %d", __FUNCTION__, last_start_time, fdw_xact_check_interval)));
++			TimeToCheckFdwXactOnGTM();
++		}
++
++		wait_time = (fdw_xact_check_interval * 1000);
++
++		/* Wait for fdw_xact_check_interval timeout */
++		rc = WaitLatch(MyLatch,
++					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
++					   wait_time,
++					   WAIT_EVENT_FDWXACT_LAUNCHER_MAIN);
++
++		if (rc & WL_POSTMASTER_DEATH)
++			proc_exit(1);
++
++		if (rc & WL_LATCH_SET)
++		{
++			ResetLatch(MyLatch);
++			CHECK_FOR_INTERRUPTS();
++		}
++
++		if (got_SIGHUP)
++		{
++			got_SIGHUP = false;
++			ProcessConfigFile(PGC_SIGHUP);
++		}
++	}
++
++	/* Not reachable */
++}
++
++
++/* Register a background worker running the foreign transaction launcher */
++void
++FdwXactLauncherRegister(void)
++{
++	BackgroundWorker bgw;
++
++	if (!fdw_xact_self_resolve)
++		return;
++
++	memset(&bgw, 0, sizeof(bgw));
++	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
++		BGWORKER_BACKEND_DATABASE_CONNECTION;
++	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
++	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "postgres");
++	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "FdwXactLauncherMain");
++	snprintf(bgw.bgw_name, BGW_MAXLEN,
++			 "foreign transaction resolver");
++	snprintf(bgw.bgw_type, BGW_MAXLEN,
++			 "foreign transaction resolver");
++	bgw.bgw_restart_time = 5;
++	bgw.bgw_notify_pid = 0;
++	bgw.bgw_main_arg = (Datum) 0;
++
++	RegisterBackgroundWorker(&bgw);
++}
++
++
+diff --git a/src/backend/access/fdwxact/libpqfdwxact/Makefile b/src/backend/access/fdwxact/libpqfdwxact/Makefile
+new file mode 100644
+index 0000000000..6821d3e1de
+--- /dev/null
++++ b/src/backend/access/fdwxact/libpqfdwxact/Makefile
+@@ -0,0 +1,37 @@
++#-------------------------------------------------------------------------
++#
++# Makefile--
++#    Makefile for src/backend/replication/libpqwalreceiver
++#
++# IDENTIFICATION
++#    src/backend/replication/libpqwalreceiver/Makefile
++#
++#-------------------------------------------------------------------------
++
++subdir = src/backend/replication/libpqwalreceiver
++top_builddir = ../../../../..
++include $(top_builddir)/src/Makefile.global
++
++override CPPFLAGS := -I$(srcdir) -I$(libpq_srcdir) $(CPPFLAGS)
++
++OBJS = \
++	$(WIN32RES) \
++	libpqfdwxact.o
++SHLIB_LINK_INTERNAL = $(libpq)
++SHLIB_LINK = $(filter -lintl, $(LIBS))
++SHLIB_PREREQS = submake-libpq
++PGFILEDESC = "libpqfdwxact - routines to communicate with remote GTM"
++NAME = libpqfdwxact
++
++all: all-shared-lib
++
++include $(top_srcdir)/src/Makefile.shlib
++
++install: all installdirs install-lib
++
++installdirs: installdirs-lib
++
++uninstall: uninstall-lib
++
++clean distclean maintainer-clean: clean-lib
++	rm -f $(OBJS)
+diff --git a/src/backend/access/fdwxact/libpqfdwxact/libpqfdwxact.c b/src/backend/access/fdwxact/libpqfdwxact/libpqfdwxact.c
+new file mode 100644
+index 0000000000..39ba638748
+--- /dev/null
++++ b/src/backend/access/fdwxact/libpqfdwxact/libpqfdwxact.c
+@@ -0,0 +1,497 @@
++/*-------------------------------------------------------------------------
++ *
++ * libpqfdwxact.c
++ *
++ * This file contains the libpq-specific parts of fdwxact. It's
++ * loaded as a dynamic module to avoid linking the main server binary with
++ * libpq.
++ *
++ * Portions Copyright (c) 2022, HighGo Software
++ *
++ *
++ * IDENTIFICATION
++ *	  src/backend/access/fdwxact/libpqfdwxact.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <unistd.h>
++#include <sys/time.h>
++
++#include "access/xlog.h"
++#include "access/fdwxact.h"
++#include "catalog/pg_type.h"
++#include "common/connect.h"
++#include "funcapi.h"
++#include "libpq-fe.h"
++#include "mb/pg_wchar.h"
++#include "miscadmin.h"
++#include "utils/builtins.h"
++#include "utils/memutils.h"
++#include "utils/guc.h"
++
++PG_MODULE_MAGIC;
++
++void		_PG_init(void);
++
++/* interface functions */
++static int fdwXact_register_cn(const char * cnxid);
++static int fdwXact_deregister_cn(const char * cnxid);
++static int fdwXact_query_registered_cn(const char * fdwxact_id);
++static int global_deadlock_check_dn(const char * dn_id, const char * wait_str);
++static int global_deadlock_check_gtm(const char * dn_id, const char * waitkeylist);
++
++static FdwXactLibpqFuncs FdwXactLibpqFunctions =
++{
++	fdwXact_register_cn,
++	fdwXact_deregister_cn,
++	fdwXact_query_registered_cn,
++	global_deadlock_check_dn,
++	global_deadlock_check_gtm
++};
++
++struct g_lock
++{
++	uint64 a;
++	uint64 b;
++	bool x;
++	bool y;
++};
++
++bool glock_detector(struct g_lock *glocks, int numrecord, uint64 tx);
++
++/* local helper functions */
++static PGconn* libpq_connect_gtm(const char *connstr);
++static void libpq_disconnect_gtm(PGconn *conn);
++//static void sortLockRecords(struct g_lock *glocks, int numrecord);
++/*
++ * Module initialization function
++ */
++void
++_PG_init(void)
++{
++	if (fdwXactLibpqFuncs != NULL)
++		elog(ERROR, "libpqwalreceiver already loaded");
++	fdwXactLibpqFuncs = &FdwXactLibpqFunctions;
++}
++
++static PGconn*
++libpq_connect_gtm(const char *connstr)
++{
++	PGconn *conn;
++
++	conn = PQconnectdb(connstr);
++	if (conn == NULL || PQstatus(conn) == CONNECTION_BAD)
++	{
++		elog(ERROR, "Failed to connect to remote database '%s' not reacheable.",
++				connstr);
++		return NULL;
++	}
++	return conn;
++}
++
++static void
++libpq_disconnect_gtm(PGconn *conn)
++{
++	PQfinish(conn);
++}
++
++static int
++fdwXact_register_cn(const char * cnxid)
++{
++	PGconn * conn = NULL;
++	PGresult * res = NULL;
++
++	StringInfoData	query;
++
++	if (Gtm2pcConnInfo && strcmp(Gtm2pcConnInfo, "") != 0)
++		conn = libpq_connect_gtm(Gtm2pcConnInfo);
++	else
++	{
++		elog(WARNING, "Gtm2pcConnInfo is not correct.");
++		return -1;
++	}
++
++	/* Check to see that the backend connection was successfully made */
++	if (PQstatus(conn) != CONNECTION_OK)
++	{
++		elog(WARNING, "Failed to connect \"%s\".", cluster_name);
++		return -1;
++	}
++
++	initStringInfo(&query);
++	appendStringInfo(&query, "INSERT INTO t_fdw_2pc_xact (xact_id, resolved) "
++			"VALUES ('%s', 'no');", cnxid);
++	res = PQexec(conn, query.data);
++	pfree(query.data);
++	query.data = NULL;
++
++	if (PQresultStatus(res) != PGRES_COMMAND_OK)
++	{
++		elog(WARNING, "Failed to register CN to GTM");
++	}
++	PQclear(res);
++
++	libpq_disconnect_gtm(conn);
++	return 0;
++}
++
++static int
++fdwXact_deregister_cn(const char * cnxid)
++{
++	PGconn * conn = NULL;
++	PGresult * res = NULL;
++
++	StringInfoData	query;
++
++	if (Gtm2pcConnInfo && strcmp(Gtm2pcConnInfo, "") != 0)
++		conn = libpq_connect_gtm(Gtm2pcConnInfo);
++	else
++	{
++		elog(WARNING, "Gtm2pcConnInfo is not correct.");
++		return -1;
++	}
++
++	/* Check to see that the backend connection was successfully made */
++	if (PQstatus(conn) != CONNECTION_OK)
++	{
++		elog(WARNING, "Failed to connect GTM");
++		return -1;
++	}
++
++	initStringInfo(&query);
++	appendStringInfo(&query, "UPDATE t_fdw_2pc_xact set resolved = 'yes' "
++			"WHERE xact_id = '%s'", cnxid);
++	res = PQexec(conn, query.data);
++	pfree(query.data);
++	query.data = NULL;
++
++	if (PQresultStatus(res) != PGRES_COMMAND_OK)
++	{
++		elog(WARNING, "Failed to deregister CN from GTM");
++	}
++	PQclear(res);
++
++	libpq_disconnect_gtm(conn);
++	return 0;
++}
++
++static int fdwXact_query_registered_cn(const char * fdwxact_id)
++{
++	int result = 0;
++	PGconn * conn = NULL;
++	PGresult * res = NULL;
++	StringInfoData  query;
++
++	if (Gtm2pcConnInfo && strcmp(Gtm2pcConnInfo, "") != 0)
++		conn = libpq_connect_gtm(Gtm2pcConnInfo);
++	else
++	{
++		elog(WARNING, "Gtm2pcConnInfo is not correct.");
++		return -1;
++	}
++
++	/* Check to see that the backend connection was successfully made */
++	if (PQstatus(conn) != CONNECTION_OK)
++	{
++		elog(WARNING, "Failed to connect GTM");
++		return -1;
++	}
++
++	initStringInfo(&query);
++	appendStringInfo(&query, "SELECT xact_id FROM t_fdw_2pc_xact "
++	                "WHERE xact_id = '%s'", fdwxact_id);
++	res = PQexec(conn, query.data);
++
++	pfree(query.data);
++	query.data = NULL;
++
++	if (PQntuples(res) >= 1)
++	{
++		elog(DEBUG2, "foreign prepared transaction \"%s\" found in GTM.", fdwxact_id);
++		result = 1;
++	}
++	else
++		elog(WARNING, "failed to query \"%s\" from GTM, number of rows = %d",
++				fdwxact_id, PQntuples(res));
++
++	PQclear(res);
++	libpq_disconnect_gtm(conn);
++
++	return result;
++
++}
++
++static int global_deadlock_check_dn(const char * dn_id, const char * wait_str)
++{
++	if (!global_deadlock_detect_enable)
++		return 0;
++
++	int found = 0;
++	int i, row;
++	PGconn * conn = NULL;
++	PGresult * res = NULL;
++	StringInfoData  query;
++
++	int num_of_g_lock_records = 0;
++	struct g_lock g_lock_records[4096]= { 0 };
++	unsigned long long cn_a, cn_b, ta, tb;
++
++	int column = 0;
++	char *token, *end;
++	const char s[2] = ",";
++	char    lock_str[64] = {0};
++	int     len = strlen(wait_str);
++	strncpy(lock_str, wait_str + 1, len - 2);
++
++	/* get the first token */
++	token = strtok(lock_str, s);
++
++	/* walk through other tokens */
++	while( token != NULL )
++	{
++		if (column == 0)
++			cn_a = strtoul(token, &end, 10);
++		if (column == 1)
++			ta = strtoul(token, &end, 10);
++		if (column == 2)
++			cn_b = strtoul(token, &end, 10);
++		if (column == 3)
++			tb = strtoul(token, &end, 10);
++
++		token = strtok(NULL, s);
++		column ++;
++	}
++	elog(WARNING, "lock check request \"%s\" from \"%s\".", wait_str, dn_id);
++	ta = (cn_a << 32) + ta;
++	tb = (cn_b << 32) + tb;
++	elog(DEBUG2, "lock check request \"%s\" from \"%s\", cn_a=%llu ta=%llu, cn_b=%llu, tb=%llu.",
++			wait_str, dn_id, cn_a, ta, cn_b, tb);
++
++	for (i=0; i<gtm_num_of_dns; i++)
++	{
++		char current_dn[128] = {0};
++
++		if (Gtm2dnConnInfoArray[i] && strcmp(Gtm2dnConnInfoArray[i], "") != 0)
++		{
++			elog(DEBUG2, "\"%s\" found.", Gtm2dnConnInfoArray[i]);
++			conn = libpq_connect_gtm(Gtm2dnConnInfoArray[i]);
++		}
++		else
++		{
++			elog(ERROR, "Gtm2dnConnInfoArray[i] is not correct.");
++			return -1;
++		}
++
++		/* Check to see that the backend connection was successfully made */
++		if (PQstatus(conn) != CONNECTION_OK)
++		{
++			elog(ERROR, "Failed to connect DN");
++			return -1;
++		}
++
++		initStringInfo(&query);
++		appendStringInfo(&query, "SELECT pg_get_waiting_locks();");
++		res = PQexec(conn, query.data);
++		pfree(query.data);
++		query.data = NULL;
++
++		if (PQntuples(res) >= 1)
++		{
++			for (row = 0; row < PQntuples(res); row++)
++			{
++				elog(WARNING, "lock \"%s\" found on \"DN\"%d by \"%s\" .", PQgetvalue(res, row, 0), i+1, cluster_name);
++
++				int column = 0;
++				char *token, *end;
++				const char s[2] = ",";
++				char    lock_str[64] = {0};
++				unsigned long long cn_a, cn_b, ta, tb;
++				int 	len = PQgetlength(res, row, 0);
++				char 	*dup = pstrdup(PQgetvalue(res, row, 0));
++				strncpy(lock_str, dup + 1, len - 2);
++
++				/* get the first token */
++				token = strtok(lock_str, s);
++
++				/* walk through other tokens */
++				while( token != NULL )
++				{
++					if (column == 0)
++						cn_a = strtoul(token, &end, 10);
++					if (column == 1)
++						ta = strtoul(token, &end, 10);
++					if (column == 2)
++						cn_b = strtoul(token, &end, 10);
++					if (column == 3)
++						tb = strtoul(token, &end, 10);
++
++					token = strtok(NULL, s);
++					column ++;
++				}
++				elog(DEBUG2, "potential lock \"%s\", cn_a=%llu ta=%llu, cn_b=%llu, tb=%llu.", PQgetvalue(res, row, 0), cn_a, ta, cn_b, tb);
++				ta = (cn_a << 32) + ta;
++				tb = (cn_b << 32) + tb;
++				elog(DEBUG2, "potential lock \"%s\", cn_a=%llu ta=%llu, cn_b=%llu, tb=%llu.", PQgetvalue(res, row, 0), cn_a, ta, cn_b, tb);
++				g_lock_records[num_of_g_lock_records].a = ta;
++				g_lock_records[num_of_g_lock_records].b = tb;
++
++				num_of_g_lock_records ++;
++				pfree(dup);
++			}
++		}
++		else
++			elog(WARNING, "NO lock found on \"DN\"%d by \"%s\".", i+1, cluster_name);
++
++		PQclear(res);
++		libpq_disconnect_gtm(conn);
++	}
++
++	found = glock_detector(g_lock_records, num_of_g_lock_records, ta);
++
++	return found;
++}
++
++static int global_deadlock_check_gtm(const char * dn_id, const char * waitkeylist)
++{
++	int result = 0;
++	PGconn * conn = NULL;
++	PGresult * res = NULL;
++	StringInfoData  query;
++
++	if (Gtm2pcConnInfo && strcmp(Gtm2pcConnInfo, "") != 0)
++		conn = libpq_connect_gtm(Gtm2pcConnInfo);
++	else
++	{
++		elog(ERROR, "Gtm2pcConnInfo is not correct.");
++		return -1;
++	}
++
++	/* Check to see that the backend connection was successfully made */
++	if (PQstatus(conn) != CONNECTION_OK)
++	{
++		elog(WARNING, "Failed to connect \"%s\".", cluster_name);
++		return -1;
++	}
++
++	initStringInfo(&query);
++	appendStringInfo(&query, "SELECT pg_check_global_deadlock('%s', '%s')", dn_id, waitkeylist);
++	elog(WARNING, "sending %s to gtm", query.data);
++	res = PQexec(conn, query.data);
++
++	pfree(query.data);
++	query.data = NULL;
++
++	if (PQntuples(res) >= 1)
++	{
++		char * gtmres = PQgetvalue(res, 0, 0);
++		if (!strcmp(gtmres, "t"))
++		{
++			elog(WARNING, "%s: global deadlock detected by \"%s\".", __FUNCTION__, cluster_name);
++			result = 1;
++		}
++		else
++			elog(WARNING, "%s: NO global deadlock detected by \"%s\".", __FUNCTION__, cluster_name);
++	}
++	else
++		elog(WARNING, "failed to query pg_check_global_deadlock() on gtm node");
++
++	PQclear(res);
++	libpq_disconnect_gtm(conn);
++
++	return result;
++}
++
++
++bool glock_detector(struct g_lock *glocks, int numrecord, uint64 tx)
++{
++	int i = 0, j = 0;
++	bool iscycle = false, found = false, result = false;
++
++	elog(WARNING, "target cn = %llu, tx = %llu", (tx >> 32), (tx & 0xFFFFFFFF));
++
++	for (;;)
++	{
++		iscycle = false;
++		found = false;
++		for (i = 0; i < numrecord; i++)
++		{
++			if (!glocks[i].x)
++			{
++				glocks[i].x = true;
++				glocks[i].y = true;
++				found = true;
++				break;
++			}
++		}
++
++		if (!found)
++			break;
++
++		for (;;)
++		{
++			found = false;
++			for (j = 0; j < numrecord; j++)
++			{
++				if (glocks[j].a == glocks[i].b)
++				{
++					elog(DEBUG2, "found a depending pair glocks[%d].a = %llu, glocks[%d].b = %llu",
++							j, (glocks[j].a & 0xFFFFFFFF), i, (glocks[i].b & 0xFFFFFFFF));
++					i = j;
++					found = true;
++					break;
++				}
++			}
++			if (!found)
++				break;
++
++			glocks[i].x = true;
++			if (glocks[i].y)
++			{
++				elog(DEBUG2, "glocks[%d].a = %llu has y set", i, (glocks[i].a & 0xFFFFFFFF));
++				iscycle = true;
++				break;
++			}
++			else
++			{
++				elog(DEBUG2, "mark glocks[%d].y", i);
++				glocks[i].y = true;
++			}
++		}
++		if (iscycle)
++		{
++			elog(WARNING, "found a cycle");
++			found = false; //cary
++			for (j = 0; j < numrecord; j++)
++			{
++				if (glocks[j].a == tx)
++				{
++					elog(DEBUG2, "found target tx glocks[%d].a = %llu, tx = %llu", j, (glocks[j].a & 0xFFFFFFFF), (tx & 0xFFFFFFFF));
++					found = true; //cary
++					if (glocks[j].y)
++					{
++						elog(DEBUG2, "glocks[%d].a == %llu has y set", j, (glocks[j].a & 0xFFFFFFFF));
++						result = true;
++						break;
++					}
++				}
++			}
++		}
++
++		for (i = 0; i < numrecord; i++)
++		{
++			glocks[i].y = false;
++		}
++	}
++
++	if (result)
++		elog(WARNING, "found a deadlock, cn = %llu, tx = %llu ", (glocks[j].a >> 32), (glocks[j].a & 0xFFFFFFFF));
++	else
++		elog(WARNING, "no deadlock found");
++
++	return result;
++}
++
++
++
+diff --git a/src/backend/access/transam/twophase.c b/src/backend/access/transam/twophase.c
+index 75551f60cb..2369499f41 100644
+--- a/src/backend/access/transam/twophase.c
++++ b/src/backend/access/transam/twophase.c
+@@ -77,6 +77,7 @@
+ #include <unistd.h>
+ 
+ #include "access/commit_ts.h"
++#include "access/fdwxact.h"
+ #include "access/htup_details.h"
+ #include "access/subtrans.h"
+ #include "access/transam.h"
+@@ -116,6 +117,10 @@
+ /* GUC variable, can't be changed after startup */
+ int			max_prepared_xacts = 0;
+ 
++/* GUC variables for checking orphaned prepared transactions */
++int			fdw_xact_max_age = 300; //300sec
++
++
+ /*
+  * This struct describes one global transaction that is in prepared state
+  * or attempting to become prepared.
+@@ -610,7 +615,7 @@ LockGXact(const char *gid, Oid user)
+ 		 * there may be some other issues as well.  Hence disallow until
+ 		 * someone gets motivated to make it work.
+ 		 */
+-		if (MyDatabaseId != proc->databaseId)
++		if (MyDatabaseId != proc->databaseId && !fdw_xact_self_resolve)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+ 					 errmsg("prepared transaction belongs to another database"),
+@@ -2296,7 +2301,20 @@ RecordTransactionCommitPrepared(TransactionId xid,
+ 	XLogRecPtr	recptr;
+ 	TimestampTz committs = GetCurrentTimestamp();
+ 	bool		replorigin;
++	bool 		need_fdwxact_commit;
++	int			partRestored = 0;
+ 
++	partRestored = RestoreFdwXactDataByXid(xid);
++	if (partRestored > 0)
++	{
++		elog(WARNING, "restored %d foreign participants data", partRestored);
++		need_fdwxact_commit = true;
++		FdwXactSet2PCRequired();
++	}
++	else
++	{
++		elog(WARNING, "no foreign participants found");
++	}
+ 	/*
+ 	 * Are we using the replication origins feature?  Or, in other words, are
+ 	 * we replaying remote actions?
+@@ -2368,6 +2386,13 @@ RecordTransactionCommitPrepared(TransactionId xid,
+ 	 * in the procarray and continue to hold locks.
+ 	 */
+ 	SyncRepWaitForLSN(recptr, true);
++
++	if (need_fdwxact_commit)
++	{
++		AtEOXact_FdwXact(true);
++
++		ForgetAllFdwXactParticipants();
++	}
+ }
+ 
+ /*
+@@ -2627,3 +2652,80 @@ LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
+ 	LWLockRelease(TwoPhaseStateLock);
+ 	return found;
+ }
++
++
++/*
++ * To be called from within a bgwriter process according to the settings,
++ * default every 10sec.
++ *
++ * Returns total number of orphaned/timed out prepared transactions and
++ * throws one warning message for every orphaned prepared transactions found,
++ * and self commit the prepared transactions on GTM if mapping found or,
++ * self rollback the prepared transactions and do nothing on GTM.
++ *
++ * Return -1 if timeout period hasn't completed.
++ *
++ * force_warning skips the timeout check for throwing warnings.
++ */
++int
++TimeToCheckFdwXactOnGTM(void)
++{
++	int			i;
++	int			num = 0;
++	int			overage_found = 0;
++	bool		found_on_gtm = false;
++	TimestampTz	current_time = GetCurrentTimestamp();
++
++	if (fdw_xact_max_age <= 0)
++		return -1;
++
++	/* Get shared lock to count orphaned transactions */
++	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
++
++	if (TwoPhaseState->numPrepXacts == 0)
++	{
++		LWLockRelease(TwoPhaseStateLock);
++		return overage_found;
++	}
++
++	num = TwoPhaseState->numPrepXacts;
++	for (i = 0; i < num; i++)
++	{
++		if (TwoPhaseState->prepXacts[i]->prepared_at != 0 &&
++				(strncmp("_fx_", TwoPhaseState->prepXacts[i]->gid, 4) == 0) &&
++				TimestampDifferenceExceeds(TwoPhaseState->prepXacts[i]->prepared_at,
++				current_time, (fdw_xact_max_age * 1000)))
++		{
++			overage_found = 1;
++			ereport(WARNING,(errmsg("found foreign prepared transaction \"%s\" at %ld.",
++					TwoPhaseState->prepXacts[i]->gid, TwoPhaseState->prepXacts[i]->prepared_at)));
++
++			if (FdwXactCheckGTM(TwoPhaseState->prepXacts[i]->gid) == 1)
++			{
++				FdwXactDeregisterGTM(TwoPhaseState->prepXacts[i]->gid);
++				TwoPhaseState->prepXacts[i]->prepared_at = 0;
++				found_on_gtm = true;
++			}
++
++			break;
++		}
++	}
++
++	LWLockRelease(TwoPhaseStateLock);
++
++	if (overage_found)
++	{
++		ereport(WARNING,
++				(errmsg("try to %s foreign prepared transaction \"%s\"."
++						, found_on_gtm ? "COMMIT":"ROLLBACK", TwoPhaseState->prepXacts[i]->gid)));
++		StartTransactionCommand();
++		FinishPreparedTransaction(TwoPhaseState->prepXacts[i]->gid, found_on_gtm);
++		CommitTransactionCommand();
++		ereport(WARNING,
++				(errmsg("foreign prepared transaction \"%s\" has been %s.",
++						TwoPhaseState->prepXacts[i]->gid, found_on_gtm ? "COMMITTED":"ROLLED BACK")));
++	}
++
++	return overage_found;
++}
++
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index d0e5bc26a7..fe1fd1c4ef 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -21,6 +21,7 @@
+ #include <unistd.h>
+ 
+ #include "access/commit_ts.h"
++#include "access/fdwxact.h"
+ #include "access/multixact.h"
+ #include "access/parallel.h"
+ #include "access/subtrans.h"
+@@ -85,6 +86,7 @@ bool		XactDeferrable;
+ 
+ int			synchronous_commit = SYNCHRONOUS_COMMIT_ON;
+ 
++char *		XactCNXid;
+ /*
+  * CheckXidAlive is a xid value pointing to a possibly ongoing (sub)
+  * transaction.  Currently, it is used in logical decoding.  It's possible
+@@ -2183,6 +2185,9 @@ CommitTransaction(void)
+ 			break;
+ 	}
+ 
++	/* Pre-commit step for foreign transactions */
++	PreCommit_FdwXact();
++
+ 	/*
+ 	 * The remaining actions cannot call any user-defined code, so it's safe
+ 	 * to start shutting down within-transaction services.  But note that most
+@@ -2298,6 +2303,9 @@ CommitTransaction(void)
+ 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_COMMIT
+ 					  : XACT_EVENT_COMMIT);
+ 
++	/* Commit foreign transaction if any */
++	AtEOXact_FdwXact(true);
++
+ 	ResourceOwnerRelease(TopTransactionResourceOwner,
+ 						 RESOURCE_RELEASE_BEFORE_LOCKS,
+ 						 true, true);
+@@ -2447,6 +2455,9 @@ PrepareTransaction(void)
+ 	 * the transaction-abort path.
+ 	 */
+ 
++	/* Prepare foreign trasactions */
++	PrePrepare_FdwXact();
++
+ 	/* Shut down the deferred-trigger manager */
+ 	AfterTriggerEndXact(true);
+ 
+@@ -2635,6 +2646,9 @@ PrepareTransaction(void)
+ 	 */
+ 	PostPrepare_Twophase();
+ 
++	/* Release held FdwXact entries */
++	PostPrepare_FdwXact();
++
+ 	/* PREPARE acts the same as COMMIT as far as GUC is concerned */
+ 	AtEOXact_GUC(true, 1);
+ 	AtEOXact_SPI(true);
+@@ -2834,6 +2848,9 @@ AbortTransaction(void)
+ 		else
+ 			CallXactCallbacks(XACT_EVENT_ABORT);
+ 
++		/* Rollback foreign transactions if any */
++		AtEOXact_FdwXact(false);
++
+ 		ResourceOwnerRelease(TopTransactionResourceOwner,
+ 							 RESOURCE_RELEASE_BEFORE_LOCKS,
+ 							 false, true);
+diff --git a/src/backend/access/transam/xlog.c b/src/backend/access/transam/xlog.c
+index 691b9622da..ae3128ae15 100644
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -331,6 +331,12 @@ typedef struct XLogwrtResult
+ 	XLogRecPtr	Flush;			/* last byte + 1 flushed */
+ } XLogwrtResult;
+ 
++/* options for GTM2PC */
++char	   *Gtm2pcConnInfo = NULL;
++char	   *Gtm2dnConnInfo = NULL;
++char 		Gtm2dnConnInfoArray[32][256];
++int			gtm_num_of_dns = 0;
++
+ /*
+  * Inserting to WAL is protected by a small fixed number of WAL insertion
+  * locks. To insert to the WAL, you must hold one of the locks - it doesn't
+diff --git a/src/backend/foreign/foreign.c b/src/backend/foreign/foreign.c
+index e60394c7f9..045dc0ec58 100644
+--- a/src/backend/foreign/foreign.c
++++ b/src/backend/foreign/foreign.c
+@@ -188,6 +188,49 @@ GetForeignServerByName(const char *srvname, bool missing_ok)
+ 	return GetForeignServer(serverid);
+ }
+ 
++/*
++ * GetUserMappingOid - look up the user mapping by user mapping oid.
++ *
++ * If userid of the mapping is invalid, we set it to current userid.
++ */
++UserMapping *
++GetUserMappingByOid(Oid umid)
++{
++	Datum		datum;
++	HeapTuple   tp;
++	UserMapping	*um;
++	bool		isnull;
++	Form_pg_user_mapping tableform;
++
++	tp = SearchSysCache1(USERMAPPINGOID,
++						 ObjectIdGetDatum(umid));
++
++	if (!HeapTupleIsValid(tp))
++		ereport(ERROR,
++				(errcode(ERRCODE_UNDEFINED_OBJECT),
++				 errmsg("user mapping not found for %d", umid)));
++
++	tableform = (Form_pg_user_mapping) GETSTRUCT(tp);
++	um = (UserMapping *) palloc(sizeof(UserMapping));
++	um->umid = umid;
++	um->userid = OidIsValid(tableform->umuser) ?
++		tableform->umuser : GetUserId();
++	um->serverid = tableform->umserver;
++
++	/* Extract the umoptions */
++	datum = SysCacheGetAttr(USERMAPPINGUSERSERVER,
++							tp,
++							Anum_pg_user_mapping_umoptions,
++							&isnull);
++	if (isnull)
++		um->options = NIL;
++	else
++		um->options = untransformRelOptions(datum);
++
++	ReleaseSysCache(tp);
++
++	return um;
++}
+ 
+ /*
+  * GetUserMapping - look up the user mapping.
+diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
+index 8dd7d64630..006ba4748c 100644
+--- a/src/backend/postmaster/bgworker.c
++++ b/src/backend/postmaster/bgworker.c
+@@ -13,6 +13,7 @@
+ #include "postgres.h"
+ 
+ #include "access/parallel.h"
++#include "access/fdwxact_launcher.h"
+ #include "libpq/pqsignal.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -128,6 +129,9 @@ static const struct
+ 	},
+ 	{
+ 		"ApplyWorkerMain", ApplyWorkerMain
++	},
++	{
++		"FdwXactLauncherMain", FdwXactLauncherMain
+ 	}
+ };
+ 
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 892d42c63e..c55be2de95 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -93,6 +93,7 @@
+ #include <pthread.h>
+ #endif
+ 
++#include "access/fdwxact_launcher.h"
+ #include "access/transam.h"
+ #include "access/xlog.h"
+ #include "access/xlogrecovery.h"
+@@ -1019,6 +1020,7 @@ PostmasterMain(int argc, char *argv[])
+ 	 * before any modules had a chance to take the background worker slots.
+ 	 */
+ 	ApplyLauncherRegister();
++	FdwXactLauncherRegister();
+ 
+ 	/*
+ 	 * process any libraries that should be preloaded at postmaster start
+diff --git a/src/backend/storage/lmgr/deadlock.c b/src/backend/storage/lmgr/deadlock.c
+index cd9c0418ec..3665544405 100644
+--- a/src/backend/storage/lmgr/deadlock.c
++++ b/src/backend/storage/lmgr/deadlock.c
+@@ -31,7 +31,8 @@
+ #include "storage/lmgr.h"
+ #include "storage/proc.h"
+ #include "utils/memutils.h"
+-
++#include "access/fdwxact.h"
++#include "utils/guc.h"
+ 
+ /*
+  * One edge in the waits-for graph.
+@@ -123,11 +124,11 @@ static int	nPossibleConstraints;
+ static int	maxPossibleConstraints;
+ static DEADLOCK_INFO *deadlockDetails;
+ static int	nDeadlockDetails;
++static char * getCurrWaitingLocks(PGPROC *proc);
+ 
+ /* PGPROC pointer of any blocking autovacuum worker found */
+ static PGPROC *blocking_autovacuum_proc = NULL;
+ 
+-
+ /*
+  * InitDeadLockChecking -- initialize deadlock checker during backend startup
+  *
+@@ -1175,3 +1176,55 @@ RememberSimpleDeadLock(PGPROC *proc1,
+ 	info->pid = proc2->pid;
+ 	nDeadlockDetails = 2;
+ }
++
++
++DeadLockState
++DeadLockCheckGTM(PGPROC *proc)
++{
++	int i = 0;
++	char * waitlocks = NULL;
++	if (fdwXactLibpqFuncs == NULL)
++		load_file("libpqfdwxact", false);
++
++	for (i = 0; i < NUM_LOCK_PARTITIONS; i++)
++		LWLockAcquire(LockHashPartitionLockByIndex(i), LW_EXCLUSIVE);
++
++	waitlocks = getCurrWaitingLocks(proc);
++
++	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
++		LWLockRelease(LockHashPartitionLockByIndex(i));
++
++	if (fdwXactLibpqFuncs->global_deadlock_check_gtm(cluster_name, waitlocks))
++		return DS_HARD_DEADLOCK;
++	else
++		return DS_NO_DEADLOCK;
++}
++
++static char *
++getCurrWaitingLocks(PGPROC *proc)
++{
++	int i = 0;
++	StringInfoData str;
++	TransactionId xwait = InvalidTransactionId;
++
++	initStringInfo(&str);
++
++	if (proc->waitProcLock->tag.myLock->tag.locktag_type == LOCKTAG_TRANSACTION)
++	{
++		xwait = proc->waitProcLock->tag.myLock->tag.locktag_field1;
++		for (i = 0; i < ProcGlobal->allProcCount; i++)
++		{
++			if (ProcGlobal->allProcs[i].backendId > 0 &&
++					ProcGlobal->allProcs[i].pid > 0 &&
++					ProcGlobal->allProcs[i].xid == xwait)
++			{
++				appendStringInfo(&str, "(%s,%u,%s,%u)",
++						proc->cnid,
++						proc->cnxid,
++						ProcGlobal->allProcs[i].cnid,
++						ProcGlobal->allProcs[i].cnxid);
++			}
++		}
++	}
++	return(str.data);
++}
+diff --git a/src/backend/storage/lmgr/lmgr.c b/src/backend/storage/lmgr/lmgr.c
+index 1543da6162..c3a9b0e8dd 100644
+--- a/src/backend/storage/lmgr/lmgr.c
++++ b/src/backend/storage/lmgr/lmgr.c
+@@ -27,7 +27,8 @@
+ #include "storage/procarray.h"
+ #include "storage/sinvaladt.h"
+ #include "utils/inval.h"
+-
++#include "utils/builtins.h"
++#include "funcapi.h"
+ 
+ /*
+  * Per-backend counter for generating speculative insertion tokens.
+@@ -1222,3 +1223,113 @@ GetLockNameFromTagType(uint16 locktag_type)
+ 		return "???";
+ 	return LockTagTypeNames[locktag_type];
+ }
++
++/*
++ * highgo: distributed database global deadlock detection SQL functions
++ */
++
++Datum
++pg_check_global_deadlock(PG_FUNCTION_ARGS)
++{
++	char *dn_str = PG_GETARG_CSTRING(0);
++	char *wait_str = PG_GETARG_CSTRING(1);
++
++	if (GlobalDeadlockGTMCheckDN(dn_str, wait_str))
++		PG_RETURN_BOOL(true);
++	else
++		PG_RETURN_BOOL(false);
++}
++
++Datum
++pg_get_waiting_locks(PG_FUNCTION_ARGS)
++{
++#define PG_PREPARED_FDWXACTS_COLS 4
++	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
++	Tuplestorestate *tupstore;
++	HeapTuple	tuple;
++	TupleDesc	tupdesc;
++	AttInMetadata *attinmeta;
++	MemoryContext per_query_ctx;
++	MemoryContext oldcontext;
++	int 		i = 0, j = 0;
++	TransactionId xwait = InvalidTransactionId;
++
++	/* check to see if caller supports us returning a tuplestore */
++	if (!rsinfo || !(rsinfo->allowedModes & SFRM_Materialize))
++		ereport(ERROR,
++				(errcode(ERRCODE_SYNTAX_ERROR),
++				 errmsg("materialize mode required, but it is not "
++						"allowed in this context")));
++
++	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
++	oldcontext = MemoryContextSwitchTo(per_query_ctx);
++
++	/* get the requested return tuple description */
++	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
++
++	if (tupdesc->natts != 4 ||
++		TupleDescAttr(tupdesc, 0)->atttypid != TEXTOID ||
++		TupleDescAttr(tupdesc, 1)->atttypid != XIDOID ||
++		TupleDescAttr(tupdesc, 2)->atttypid != TEXTOID ||
++		TupleDescAttr(tupdesc, 3)->atttypid != XIDOID)
++		ereport(ERROR,
++				(errcode(ERRCODE_SYNTAX_ERROR),
++				 errmsg("query-specified return tuple and "
++						"function return type are not compatible")));
++
++	/* OK to use it */
++	attinmeta = TupleDescGetAttInMetadata(tupdesc);
++
++	/* let the caller know we're sending back a tuplestore */
++	rsinfo->returnMode = SFRM_Materialize;
++
++	/* initialize our tuplestore */
++	tupstore = tuplestore_begin_heap(true, false, work_mem);
++
++	for (i = 0; i < ProcGlobal->allProcCount; i++)
++	{
++		if (ProcGlobal->allProcs[i].backendId > 0 &&
++				ProcGlobal->allProcs[i].pid > 0 &&
++				ProcGlobal->allProcs[i].waitProcLock != NULL)
++		{
++			/* Found a waiter here - we only handle locktype = transaction */
++			if (ProcGlobal->allProcs[i].waitProcLock->tag.myLock->tag.locktag_type ==
++					LOCKTAG_TRANSACTION)
++			{
++				xwait = ProcGlobal->allProcs[i].waitProcLock->tag.myLock->tag.locktag_field1;
++				for (j = 0; j < ProcGlobal->allProcCount; j++)
++				{
++					if (ProcGlobal->allProcs[j].backendId > 0 &&
++							ProcGlobal->allProcs[j].pid > 0 &&
++							ProcGlobal->allProcs[j].xid == xwait)
++					{
++//						elog(WARNING, "I am %s_%u and waiting for %s_%u to commit",
++//								ProcGlobal->allProcs[i].cnid,
++//								ProcGlobal->allProcs[i].cnxid,
++//								ProcGlobal->allProcs[j].cnid,
++//								ProcGlobal->allProcs[j].cnxid);
++
++						Datum values[PG_PREPARED_FDWXACTS_COLS];
++						bool nulls[PG_PREPARED_FDWXACTS_COLS];
++
++						memset(nulls, 0, sizeof(nulls));
++						values[0] = CStringGetTextDatum(ProcGlobal->allProcs[i].cnid);
++						values[1] = TransactionIdGetDatum(ProcGlobal->allProcs[i].cnxid);
++						values[2] = CStringGetTextDatum(ProcGlobal->allProcs[j].cnid);
++						values[3] = TransactionIdGetDatum(ProcGlobal->allProcs[j].cnxid);
++
++						tuplestore_putvalues(tupstore, tupdesc, values, nulls);
++					}
++				}
++			}
++		}
++	}
++	ReleaseTupleDesc(tupdesc);
++	tuplestore_donestoring(tupstore);
++	rsinfo->setResult = tupstore;
++
++	rsinfo->setDesc = tupdesc;
++	MemoryContextSwitchTo(oldcontext);
++
++	return (Datum) 0;
++}
+diff --git a/src/backend/storage/lmgr/proc.c b/src/backend/storage/lmgr/proc.c
+index 28b445f560..a10811b97b 100644
+--- a/src/backend/storage/lmgr/proc.c
++++ b/src/backend/storage/lmgr/proc.c
+@@ -438,6 +438,9 @@ InitProcess(void)
+ 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
+ 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PGPROCNO);
+ 
++	/* highgo distributed database */
++	memset(MyProc->cnid, 0, sizeof(MyProc->cnid));
++	MyProc->cnxid = InvalidTransactionId;
+ 	/*
+ 	 * Acquire ownership of the PGPROC's latch, so that we can use WaitLatch
+ 	 * on it.  That allows us to repoint the process latch, which so far
+@@ -1344,6 +1347,7 @@ ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable)
+ 			/* check for deadlocks first, as that's probably log-worthy */
+ 			if (got_deadlock_timeout)
+ 			{
++				elog(WARNING, "calling CheckDeadLock");
+ 				CheckDeadLock();
+ 				got_deadlock_timeout = false;
+ 			}
+@@ -1766,6 +1770,7 @@ CheckDeadLock(void)
+ {
+ 	int			i;
+ 
++	elog(WARNING, "%s: ", __FUNCTION__);
+ 	/*
+ 	 * Acquire exclusive lock on the entire shared lock data structures. Must
+ 	 * grab LWLocks in partition-number order to avoid LWLock deadlock.
+@@ -1840,6 +1845,25 @@ CheckDeadLock(void)
+ check_done:
+ 	for (i = NUM_LOCK_PARTITIONS; --i >= 0;)
+ 		LWLockRelease(LockHashPartitionLockByIndex(i));
++
++	/* highgo TODO: move this piece of code above within lockAcquire and lockRelease
++	 * to ensure the most accurate deadlock checking. We also need to change
++	 * DeadLockCheckGTM to have an option to provide an argument such that GTM does
++	 * not query back lock waiting list while all locks have been locked, causing
++	 * connection deadlock
++	 */
++	if (XactCNXid != NULL && strlen(XactCNXid) > 0)
++	{
++		/* highgo: if XactCNXid has valid value, we are capable of doing a
++		 * global deadlock check via an external GTM service
++		 */
++		deadlock_state = DeadLockCheckGTM(MyProc);
++		if (deadlock_state == DS_HARD_DEADLOCK)
++		{
++			Assert(MyProc->waitLock != NULL);
++			RemoveFromWaitQueue(MyProc, LockTagHashCode(&(MyProc->waitLock->tag)));
++		}
++	}
+ }
+ 
+ /*
+diff --git a/src/backend/utils/misc/guc.c b/src/backend/utils/misc/guc.c
+index e9084f4506..279b4f97d1 100644
+--- a/src/backend/utils/misc/guc.c
++++ b/src/backend/utils/misc/guc.c
+@@ -43,6 +43,7 @@
+ #include "access/xlog_internal.h"
+ #include "access/xlogprefetcher.h"
+ #include "access/xlogrecovery.h"
++#include "access/fdwxact.h"
+ #include "catalog/namespace.h"
+ #include "catalog/objectaccess.h"
+ #include "catalog/pg_authid.h"
+@@ -243,6 +244,10 @@ static void assign_recovery_target_lsn(const char *newval, void *extra);
+ static bool check_primary_slot_name(char **newval, void **extra, GucSource source);
+ static bool check_default_with_oids(bool *newval, void **extra, GucSource source);
+ 
++static bool check_transaction_cnxid(char **newval, void **extra, GucSource source);
++static bool parse_gtm2dn_conninfo(char **newval, void **extra, GucSource source);
++
++
+ /* Private functions in guc-file.l that need to be called from guc.c */
+ static ConfigVariable *ProcessConfigFileInternal(GucContext context,
+ 												 bool applySettings, int elevel);
+@@ -596,6 +601,24 @@ static const struct config_enum_entry wal_compression_options[] = {
+ 	{NULL, 0, false}
+ };
+ 
++/*
++ * Although only "required" and "disabled" are documented, we accept all
++ * the likely variants of "on" and "off".
++ */
++static const struct config_enum_entry foreign_twophase_commit_options[] = {
++	{"required", FOREIGN_TWOPHASE_COMMIT_REQUIRED, false},
++	{"disabled", FOREIGN_TWOPHASE_COMMIT_DISABLED, false},
++	{"on", FOREIGN_TWOPHASE_COMMIT_REQUIRED, false},
++	{"off", FOREIGN_TWOPHASE_COMMIT_DISABLED, false},
++	{"true", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
++	{"false", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
++	{"yes", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
++	{"no", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
++	{"1", FOREIGN_TWOPHASE_COMMIT_REQUIRED, true},
++	{"0", FOREIGN_TWOPHASE_COMMIT_DISABLED, true},
++	{NULL, 0, false}
++};
++
+ /*
+  * Options for enum values stored in other modules
+  */
+@@ -2172,6 +2195,24 @@ static struct config_bool ConfigureNamesBool[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"fdw_xact_self_resolve", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Whether to enable self resolve fdw prepared foreign transaction."),
++		},
++		&fdw_xact_self_resolve,
++		false,
++		NULL, NULL, NULL
++	},
++
++	{
++		{"global_deadlock_detect_enable", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Whether to enable global deadlock detection."),
++		},
++		&global_deadlock_detect_enable,
++		false,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, false, NULL, NULL, NULL
+@@ -2617,6 +2658,38 @@ static struct config_int ConfigureNamesInt[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"max_prepared_foreign_transactions", PGC_POSTMASTER, RESOURCES_MEM,
++			gettext_noop("Sets the maximum number of simultaneously prepared transactions on foreign servers."),
++			NULL
++		},
++		&max_prepared_foreign_xacts,
++		0, 0, INT_MAX,
++		NULL, NULL, NULL
++	},
++
++	{
++		{"fdw_xact_check_interval", PGC_SIGHUP, LOGGING_WHEN,
++			gettext_noop("Sets the check interval for finding out the orphaned prepared transaction over fdw."),
++			NULL,
++			GUC_UNIT_S
++		},
++		&fdw_xact_check_interval,
++		60, 1, 3600,
++		NULL, NULL, NULL
++	},
++
++	{
++		{"fdw_xact_max_age", PGC_SIGHUP, LOGGING_WHEN,
++			gettext_noop("Sets the maximum age for a prepared transaction over fdw before self resolving."),
++			NULL,
++			GUC_UNIT_S
++		},
++		&fdw_xact_max_age,
++		300, 10, INT_MAX,
++		NULL, NULL, NULL
++	},
++
+ #ifdef LOCK_DEBUG
+ 	{
+ 		{"trace_lock_oidmin", PGC_SUSET, DEVELOPER_OPTIONS,
+@@ -4069,6 +4142,17 @@ static struct config_string ConfigureNamesString[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"gtm2pc_conninfo", PGC_SIGHUP, REPLICATION_STANDBY,
++			gettext_noop("Sets the connection string to be used to connect to the GTM2PC server."),
++			NULL,
++			GUC_SUPERUSER_ONLY
++		},
++		&Gtm2pcConnInfo,
++		"",
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"primary_slot_name", PGC_SIGHUP, REPLICATION_STANDBY,
+ 			gettext_noop("Sets the name of the replication slot to use on the sending server."),
+@@ -4711,6 +4795,28 @@ static struct config_string ConfigureNamesString[] =
+ 		check_backtrace_functions, assign_backtrace_functions, NULL
+ 	},
+ 
++	{
++		{"transaction_cnxid", PGC_USERSET, CLIENT_CONN_STATEMENT,
++			gettext_noop("Sets the current transaction's CN and Transaction ID"),
++			NULL,
++			GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
++		},
++		&XactCNXid,
++		"none",
++		check_transaction_cnxid, NULL, NULL
++	},
++
++	{
++		{"gtm2dn_conninfo", PGC_USERSET, CLIENT_CONN_STATEMENT,
++			gettext_noop("Sets the connection strings to DN(s) for global deadlock detection."),
++			NULL,
++			GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
++		},
++		&Gtm2dnConnInfo,
++		"none",
++		parse_gtm2dn_conninfo, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, NULL, NULL, NULL, NULL
+@@ -5109,6 +5215,16 @@ static struct config_enum ConfigureNamesEnum[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"foreign_twophase_commit", PGC_USERSET, FOREIGN_TRANSACTION,
++		 gettext_noop("Use of foreign twophase commit for the current transaction."),
++			NULL
++		},
++		&foreign_twophase_commit,
++		FOREIGN_TWOPHASE_COMMIT_DISABLED, foreign_twophase_commit_options,
++		NULL, NULL, NULL
++	},
++
+ 	/* End-of-list marker */
+ 	{
+ 		{NULL, 0, 0, NULL, NULL}, NULL, 0, NULL, NULL, NULL, NULL
+@@ -12991,4 +13107,51 @@ check_default_with_oids(bool *newval, void **extra, GucSource source)
+ 	return true;
+ }
+ 
++static bool
++check_transaction_cnxid(char **newval, void **extra, GucSource source)
++{
++	if (source == PGC_S_SESSION)
++	{
++		if (*newval && strlen(*newval) > 0)
++		{
++			char * dup = pstrdup(*newval);
++			char * tmp = strtok(dup, "_");
++			if (tmp)
++			{
++				strcpy(MyProc->cnid, tmp);
++				tmp = strtok(NULL, "_");
++				if (tmp)
++				{
++					MyProc->cnxid = atoi(tmp);
++				}
++			}
++			pfree(dup);
++		}
++	}
++	return true;
++}
++
++static bool
++parse_gtm2dn_conninfo(char **newval, void **extra, GucSource source)
++{
++	if (*newval && strlen(*newval) > 0)
++	{
++		char * dup = pstrdup(*newval);
++		char * tmp = strtok(dup, "|");
++
++		gtm_num_of_dns = 0;
++		while (tmp != NULL)
++		{
++			strcpy(&Gtm2dnConnInfoArray[gtm_num_of_dns][0], tmp);
++			gtm_num_of_dns ++;
++			elog(WARNING, "gtm_num_of_dns = %d, gtm2dn_conninfo = \"%s\"", gtm_num_of_dns, tmp);
++			tmp = strtok (NULL, "|");
++		}
++
++		pfree(dup);
++	}
++
++	return true;
++}
++
+ #include "guc-file.c"
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index 429844fdd3..934c329b89 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -219,6 +219,7 @@ static const char *const subdirs[] = {
+ 	"pg_snapshots",
+ 	"pg_subtrans",
+ 	"pg_twophase",
++	"pg_fdwxact",
+ 	"pg_multixact",
+ 	"pg_multixact/members",
+ 	"pg_multixact/offsets",
+diff --git a/src/include/access/fdwxact.h b/src/include/access/fdwxact.h
+new file mode 100644
+index 0000000000..5e01786e97
+--- /dev/null
++++ b/src/include/access/fdwxact.h
+@@ -0,0 +1,194 @@
++/*
++ * fdwxact.h
++ *
++ * PostgreSQL global transaction manager
++ *
++ * Portions Copyright (c) 2021, PostgreSQL Global Development Group
++ *
++ * src/include/access/fdwxact.h
++ */
++#ifndef FDWXACT_H
++#define FDWXACT_H
++
++#include "access/fdwxact_xlog.h"
++#include "foreign/foreign.h"
++#include "storage/proc.h"
++#include "storage/shmem.h"
++#include "storage/s_lock.h"
++
++/* fdwXactState */
++#define	FDWXACT_NOT_WAITING		0
++#define	FDWXACT_WAITING			1
++#define	FDWXACT_WAIT_COMPLETE	2
++
++/* Flag passed to FDW transaction management APIs */
++#define FDWXACT_FLAG_ONEPHASE			0x01	/* transaction can commit/rollback
++												 * without preparation */
++#define FDWXACT_FLAG_USE_GLOBAL_CSN		0x02	/* transaction pushes a global CSN value
++												 * to all transaction participants */
++
++/* Enum for foreign_twophase_commit parameter */
++typedef enum
++{
++	FOREIGN_TWOPHASE_COMMIT_DISABLED,	/* disable foreign twophase commit */
++	FOREIGN_TWOPHASE_COMMIT_REQUIRED	/* all foreign servers have to support
++										 * twophase commit */
++}			ForeignTwophaseCommitLevel;
++
++/* Enum to track the status of foreign transaction */
++typedef enum
++{
++	FDWXACT_STATUS_INVALID = 0,
++	FDWXACT_STATUS_PREPARING,	/* foreign transaction is being prepared */
++	FDWXACT_STATUS_PREPARED,	/* foreign transaction is prepared */
++	FDWXACT_STATUS_COMMITTING,	/* foreign prepared transaction is committed */
++	FDWXACT_STATUS_ABORTING		/* foreign prepared transaction is aborted */
++} FdwXactStatus;
++
++/*
++ * Shared memory state of a single foreign transaction.
++ */
++typedef struct FdwXactData *FdwXact;
++typedef struct FdwXactData
++{
++	FdwXact		fdwxact_free_next;	/* Next free FdwXact entry */
++
++	TransactionId local_xid;	/* XID of local transaction */
++
++	/*
++	 * A backend process that executed the distributed transaction. The owner
++	 * and a process locking this entry can be different during transaction
++	 * resolution as the resolver takes over the entry.
++	 */
++	PGPROC		*proc;			/* process that executed the distributed tx. */
++
++	/* Information relevant with foreign transaction */
++	Oid			dbid;
++	Oid			serverid;
++	Oid			userid;
++	Oid			umid;
++
++	/* Foreign transaction status */
++	FdwXactStatus status;
++	slock_t		mutex;			/* protect the above field */
++
++	/*
++	 * Note that we need to keep track of two LSNs for each FdwXact. We keep
++	 * track of the start LSN because this is the address we must use to read
++	 * state data back from WAL when committing a FdwXact. We keep track of
++	 * the end LSN because that is the LSN we need to wait for prior to
++	 * commit.
++	 */
++	XLogRecPtr	insert_start_lsn;	/* XLOG offset of inserting this entry
++									 * start */
++	XLogRecPtr	insert_end_lsn; /* XLOG offset of inserting this entry end */
++
++	bool		valid;			/* has the entry been complete and written to
++								 * file? */
++	BackendId	locking_backend;	/* backend currently working on the fdw xact */
++	bool		ondisk;			/* true if prepare state file is on disk */
++	bool		inredo;			/* true if entry was added via xlog_redo */
++
++	char		fdwxact_id[FDWXACT_ID_MAX_LEN]; /* prepared transaction
++												 * identifier */
++}			FdwXactData;
++
++/*
++ * Shared memory layout for maintaining foreign prepared transaction entries.
++ * Adding or removing FdwXact entry needs to hold FdwXactLock in exclusive mode,
++ * and iterating fdwXacts needs that in shared mode.
++ */
++typedef struct
++{
++	/* Head of linked list of free FdwXactData structs */
++	FdwXact		free_fdwxacts;
++
++	/* Number of valid foreign transaction entries */
++	int			num_fdwxacts;
++
++	/* Upto max_prepared_foreign_xacts entries in the array */
++	FdwXact		fdwxacts[FLEXIBLE_ARRAY_MEMBER];	/* Variable length array */
++} FdwXactCtlData;
++
++/* Pointer to the shared memory holding the foreign transactions data */
++FdwXactCtlData *FdwXactCtl;
++
++/* State data for foreign transaction resolution, passed to FDW callbacks */
++typedef struct FdwXactRslvState
++{
++	TransactionId xid;
++
++	/* Foreign transaction information */
++	char		   *fdwxact_id;
++	ForeignServer *server;
++	UserMapping *usermapping;
++	bool 		isEnded;
++	int			flags;			/* OR of FDWXACT_FLAG_xx flags */
++} FdwXactRslvState;
++
++/* GUC parameters */
++extern int	max_prepared_foreign_xacts;
++extern bool	fdw_xact_self_resolve;
++extern int	fdw_xact_check_interval;
++extern int	foreign_twophase_commit;
++extern bool	global_deadlock_detect_enable;
++
++/* Function declarations */
++extern Size FdwXactShmemSize(void);
++extern void FdwXactShmemInit(void);
++extern void AtEOXact_FdwXact(bool is_commit);
++extern void PreCommit_FdwXact(void);
++extern void PrePrepare_FdwXact(void);
++extern void PostPrepare_FdwXact(void);
++extern bool CollectFdwXactParticipants(TransactionId xid);
++extern void SetFdwXactParticipants(TransactionId xid);
++extern bool FdwXactIsForeignTwophaseCommitRequired(void);
++extern void FdwXactCleanupAtProcExit(void);
++extern void FdwXactWaitForResolution(TransactionId wait_xid, bool commit);
++extern PGPROC *FdwXactGetWaiter(TimestampTz now, TimestampTz *nextResolutionTs_p,
++								TransactionId *waitXid_p);
++extern bool FdwXactWaiterExists(Oid dbid);
++extern void FdwXactResolveFdwXacts(int *fdwxact_idxs, int nfdwxacts, PGPROC *waiter);
++extern void ForgetAllFdwXactParticipants(void);
++extern bool FdwXactExists(Oid dbid, Oid serverid, Oid userid);
++extern void CheckPointFdwXacts(XLogRecPtr redo_horizon);
++extern void RecreateFdwXactFile(Oid dbid, TransactionId xid, Oid serverid,
++								Oid userid, void *content, int len);
++extern void RestoreFdwXactData(void);
++extern void RecoverFdwXacts(void);
++extern TransactionId PrescanFdwXacts(TransactionId oldestActiveXid);
++extern int FdwXactDeregisterGTM(const char * fdwxact_id);
++extern int FdwXactCheckGTM(const char * fdwxact_id);
++extern int RestoreFdwXactDataByXid(TransactionId xid);
++void FdwXactSet2PCRequired(void);
++
++/* Global Deadlock Detection Routines*/
++extern int GlobalDeadlockGTMCheckDN(const char * dn_id, const char * wait_str);
++
++/* FdwXact GTM Routine Callbacks */
++typedef int (*fdwxact_register_cn_fn) (const char * fdwxact_id);
++
++typedef int (*fdwxact_deregister_cn_fn) (const char * fdwxact_id);
++
++typedef int (*fdwxact_query_registered_cn_fn) (const char * fdwxact_id);
++
++typedef int (*global_deadlock_check_dn_fn) (const char * dn_id, const char * wait_str);
++
++typedef int (*global_deadlock_check_gtm_fn) (const char * dn_id, const char * waitkeylist);
++
++typedef struct FdwXactLibpqFuncs
++{
++	fdwxact_register_cn_fn fdwxact_register_cn;
++	fdwxact_deregister_cn_fn fdwxact_deregister_cn;
++	fdwxact_query_registered_cn_fn fdwxact_query_registered_cn;
++	global_deadlock_check_dn_fn global_deadlock_check_dn;
++	global_deadlock_check_gtm_fn global_deadlock_check_gtm;
++} FdwXactLibpqFuncs;
++
++extern PGDLLIMPORT FdwXactLibpqFuncs * fdwXactLibpqFuncs;
++
++
++
++
++
++#endif /* FDWXACT_H */
+diff --git a/src/include/access/fdwxact_launcher.h b/src/include/access/fdwxact_launcher.h
+new file mode 100644
+index 0000000000..9c26993375
+--- /dev/null
++++ b/src/include/access/fdwxact_launcher.h
+@@ -0,0 +1,23 @@
++/*-------------------------------------------------------------------------
++ *
++ * fdwxact_launcher.h
++ *	  PostgreSQL foreign transaction launcher definitions
++ *
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * src/include/access/fdwxact_launcher.h
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#ifndef FDWXACT_LAUNCHER_H
++#define FDWXACT_LAUNCHER_H
++
++#include "access/fdwxact.h"
++
++extern void FdwXactLauncherRegister(void);
++extern void FdwXactLauncherMain(Datum main_arg);
++
++
++#endif							/* FDWXACT_LAUNCHER_H */
+diff --git a/src/include/access/fdwxact_xlog.h b/src/include/access/fdwxact_xlog.h
+new file mode 100644
+index 0000000000..b4cec76eae
+--- /dev/null
++++ b/src/include/access/fdwxact_xlog.h
+@@ -0,0 +1,54 @@
++/*-------------------------------------------------------------------------
++ *
++ * fdwxact_xlog.h
++ *	  Foreign transaction XLOG definitions.
++ *
++ *
++ * Portions Copyright (c) 2020, PostgreSQL Global Development Group
++ *
++ * src/include/access/fdwxact_xlog.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef FDWXACT_XLOG_H
++#define FDWXACT_XLOG_H
++
++#include "access/xlogreader.h"
++#include "lib/stringinfo.h"
++
++/* Info types for logs related to FDW transactions */
++#define XLOG_FDWXACT_INSERT	0x00
++#define XLOG_FDWXACT_REMOVE	0x10
++
++/* Maximum length of the prepared transaction id, borrowed from twophase.c */
++#define FDWXACT_ID_MAX_LEN 200
++
++/*
++ * On disk file structure, also used to WAL
++ */
++typedef struct
++{
++	TransactionId local_xid;
++	Oid			dbid;			/* database oid where to find foreign server
++								 * and user mapping */
++	Oid			serverid;		/* foreign server where transaction takes
++								 * place */
++	Oid			userid;			/* user who initiated the foreign transaction */
++	Oid			umid;
++	char		fdwxact_id[FDWXACT_ID_MAX_LEN]; /* foreign txn prepare id */
++} FdwXactOnDiskData;
++
++typedef struct xl_fdwxact_remove
++{
++	TransactionId xid;
++	Oid			serverid;
++	Oid			userid;
++	Oid			dbid;
++	bool		force;
++} xl_fdwxact_remove;
++
++extern void fdwxact_redo(XLogReaderState *record);
++extern void fdwxact_desc(StringInfo buf, XLogReaderState *record);
++extern const char *fdwxact_identify(uint8 info);
++
++#endif							/* FDWXACT_XLOG_H */
+diff --git a/src/include/access/twophase.h b/src/include/access/twophase.h
+index 5d6544e267..fe2fcc38c9 100644
+--- a/src/include/access/twophase.h
++++ b/src/include/access/twophase.h
+@@ -27,6 +27,7 @@ typedef struct GlobalTransactionData *GlobalTransaction;
+ 
+ /* GUC variable */
+ extern PGDLLIMPORT int max_prepared_xacts;
++extern PGDLLIMPORT int fdw_xact_max_age;
+ 
+ extern Size TwoPhaseShmemSize(void);
+ extern void TwoPhaseShmemInit(void);
+@@ -62,4 +63,6 @@ extern void PrepareRedoRemove(TransactionId xid, bool giveWarning);
+ extern void restoreTwoPhaseData(void);
+ extern bool LookupGXact(const char *gid, XLogRecPtr prepare_at_lsn,
+ 						TimestampTz origin_prepare_timestamp);
++
++extern int TimeToCheckFdwXactOnGTM(void);
+ #endif							/* TWOPHASE_H */
+diff --git a/src/include/access/xact.h b/src/include/access/xact.h
+index 8d46a781bb..c8dd9b9e5e 100644
+--- a/src/include/access/xact.h
++++ b/src/include/access/xact.h
+@@ -40,7 +40,7 @@
+ 
+ extern PGDLLIMPORT int DefaultXactIsoLevel;
+ extern PGDLLIMPORT int XactIsoLevel;
+-
++extern char *		XactCNXid;
+ /*
+  * We implement three isolation levels internally.
+  * The two stronger ones use one snapshot per database transaction;
+diff --git a/src/include/access/xlog.h b/src/include/access/xlog.h
+index cd674c3c23..661c236835 100644
+--- a/src/include/access/xlog.h
++++ b/src/include/access/xlog.h
+@@ -51,6 +51,10 @@ extern PGDLLIMPORT char *wal_consistency_checking_string;
+ extern PGDLLIMPORT bool log_checkpoints;
+ extern PGDLLIMPORT bool track_wal_io_timing;
+ extern PGDLLIMPORT int wal_decode_buffer_size;
++extern PGDLLIMPORT char *Gtm2pcConnInfo;
++extern PGDLLIMPORT char *Gtm2dnConnInfo;
++extern PGDLLIMPORT char Gtm2dnConnInfoArray[32][256];
++extern PGDLLIMPORT int gtm_num_of_dns;
+ 
+ extern PGDLLIMPORT int CheckPointSegments;
+ 
+diff --git a/src/include/catalog/pg_proc.dat b/src/include/catalog/pg_proc.dat
+index 8de88348ec..5ed5f65a90 100644
+--- a/src/include/catalog/pg_proc.dat
++++ b/src/include/catalog/pg_proc.dat
+@@ -11811,5 +11811,18 @@
+   proname => 'brin_minmax_multi_summary_send', provolatile => 's',
+   prorettype => 'bytea', proargtypes => 'pg_brin_minmax_multi_summary',
+   prosrc => 'brin_minmax_multi_summary_send' },
+-
++  
++# function to be called by GTM to get list of waiting locks 
++{ oid => '5556', descr => 'pg_get_waiting_locks as a function',
++  proname => 'pg_get_waiting_locks', prorows => '100', proretset => 't', 
++  provolatile => 's', proparallel => 'r', prorettype => 'record', proargtypes => '',
++  proallargtypes => '{text,xid,text,xid}', proargmodes => '{o,o,o,o}',
++  proargnames => '{clusterid,xid,clusterid,xid}', prosrc => 'pg_get_waiting_locks' },
++  
++# function to be called by DN to detect global deadlock 
++{ oid => '5557', descr => 'I/O',
++  proname => 'pg_check_global_deadlock', prorettype => 'bool',
++  proargtypes => 'cstring cstring', prosrc => 'pg_check_global_deadlock' }
++
++  
+ ]
+diff --git a/src/include/foreign/fdwapi.h b/src/include/foreign/fdwapi.h
+index 57c02bff45..ce1f3261a9 100644
+--- a/src/include/foreign/fdwapi.h
++++ b/src/include/foreign/fdwapi.h
+@@ -13,6 +13,7 @@
+ #define FDWAPI_H
+ 
+ #include "access/parallel.h"
++#include "access/fdwxact.h"
+ #include "nodes/execnodes.h"
+ #include "nodes/pathnodes.h"
+ 
+@@ -183,6 +184,15 @@ typedef List *(*ReparameterizeForeignPathByChild_function) (PlannerInfo *root,
+ 															List *fdw_private,
+ 															RelOptInfo *child_rel);
+ 
++typedef void (*PrepareForeignTransaction_function) (FdwXactRslvState *frstate);
++typedef void (*CommitForeignTransaction_function) (FdwXactRslvState *frstate);
++typedef void (*RollbackForeignTransaction_function) (FdwXactRslvState *frstate);
++typedef char *(*GetPrepareId_function) (TransactionId xid, Oid serverid,
++										Oid userid, int *prep_id_len);
++/* CSN based global snapshot functions */
++//typedef uint64 (*PrepareForeignCSNSnapshot_function) (FdwXactRslvState *frstate);
++//typedef void (*AssignGlobalCSN_function) (FdwXactRslvState *frstate, CSN max_csn);
++
+ typedef bool (*IsForeignPathAsyncCapable_function) (ForeignPath *path);
+ 
+ typedef void (*ForeignAsyncRequest_function) (AsyncRequest *areq);
+@@ -278,6 +288,15 @@ typedef struct FdwRoutine
+ 	ForeignAsyncRequest_function ForeignAsyncRequest;
+ 	ForeignAsyncConfigureWait_function ForeignAsyncConfigureWait;
+ 	ForeignAsyncNotify_function ForeignAsyncNotify;
++	
++	/* Support functions for transaction management */
++	CommitForeignTransaction_function CommitForeignTransaction;
++	RollbackForeignTransaction_function RollbackForeignTransaction;
++	PrepareForeignTransaction_function PrepareForeignTransaction;
++	GetPrepareId_function GetPrepareId;
++	/* Global snapshot support */
++	//PrepareForeignCSNSnapshot_function PrepareForeignCSNSnapshot;
++	//AssignGlobalCSN_function AssignGlobalCSN;
+ } FdwRoutine;
+ 
+ 
+@@ -291,4 +310,8 @@ extern bool IsImportableForeignTable(const char *tablename,
+ 									 ImportForeignSchemaStmt *stmt);
+ extern Path *GetExistingLocalJoinPath(RelOptInfo *joinrel);
+ 
++/* Functions in fdwxact/fdwxact.c */
++extern void FdwXactRegisterXact(Oid serverid, Oid userid, bool modified);
++extern void FdwXactUnregisterXact(Oid serverid, Oid userid);
++
+ #endif							/* FDWAPI_H */
+diff --git a/src/include/foreign/foreign.h b/src/include/foreign/foreign.h
+index 75538110fc..d622ca0e3e 100644
+--- a/src/include/foreign/foreign.h
++++ b/src/include/foreign/foreign.h
+@@ -69,6 +69,7 @@ extern ForeignServer *GetForeignServerExtended(Oid serverid,
+ 											   bits16 flags);
+ extern ForeignServer *GetForeignServerByName(const char *name, bool missing_ok);
+ extern UserMapping *GetUserMapping(Oid userid, Oid serverid);
++extern UserMapping *GetUserMappingByOid(Oid umid);
+ extern ForeignDataWrapper *GetForeignDataWrapper(Oid fdwid);
+ extern ForeignDataWrapper *GetForeignDataWrapperExtended(Oid fdwid,
+ 														 bits16 flags);
+diff --git a/src/include/storage/lock.h b/src/include/storage/lock.h
+index e4e1495b24..c32ae1aaea 100644
+--- a/src/include/storage/lock.h
++++ b/src/include/storage/lock.h
+@@ -613,4 +613,7 @@ extern void VirtualXactLockTableInsert(VirtualTransactionId vxid);
+ extern void VirtualXactLockTableCleanup(void);
+ extern bool VirtualXactLock(VirtualTransactionId vxid, bool wait);
+ 
++/* highgo: added for distributed database */
++DeadLockState DeadLockCheckGTM(PGPROC *proc);
++
+ #endif							/* LOCK_H_ */
+diff --git a/src/include/storage/proc.h b/src/include/storage/proc.h
+index 2579e619eb..4067969249 100644
+--- a/src/include/storage/proc.h
++++ b/src/include/storage/proc.h
+@@ -295,6 +295,10 @@ struct PGPROC
+ 	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
+ 	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
+ 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
++
++	/* highgo distributed database: CN identifiers */
++	TransactionId cnxid;
++	char cnid[32];
+ };
+ 
+ /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
+diff --git a/src/include/utils/guc_tables.h b/src/include/utils/guc_tables.h
+index 067d82ada9..9b5caa054f 100644
+--- a/src/include/utils/guc_tables.h
++++ b/src/include/utils/guc_tables.h
+@@ -95,7 +95,8 @@ enum config_group
+ 	ERROR_HANDLING_OPTIONS,
+ 	PRESET_OPTIONS,
+ 	CUSTOM_OPTIONS,
+-	DEVELOPER_OPTIONS
++	DEVELOPER_OPTIONS,
++	FOREIGN_TRANSACTION
+ };
+ 
+ /*
+diff --git a/src/include/utils/wait_event.h b/src/include/utils/wait_event.h
+index b578e2ec75..20643a2a08 100644
+--- a/src/include/utils/wait_event.h
++++ b/src/include/utils/wait_event.h
+@@ -40,6 +40,7 @@ typedef enum
+ 	WAIT_EVENT_BGWRITER_HIBERNATE,
+ 	WAIT_EVENT_BGWRITER_MAIN,
+ 	WAIT_EVENT_CHECKPOINTER_MAIN,
++	WAIT_EVENT_FDWXACT_LAUNCHER_MAIN,
+ 	WAIT_EVENT_LOGICAL_APPLY_MAIN,
+ 	WAIT_EVENT_LOGICAL_LAUNCHER_MAIN,
+ 	WAIT_EVENT_RECOVERY_WAL_STREAM,
+diff --git a/tc-1-multi-shard.sh b/tc-1-multi-shard.sh
+new file mode 100755
+index 0000000000..0979ddc252
+--- /dev/null
++++ b/tc-1-multi-shard.sh
+@@ -0,0 +1,33 @@
++#!/bin/bash
++
++#set -x
++
++
++### load local environment
++source pgenv_fdw
++
++
++echo "[`date`] `basename` $0 started ..."
++
++for ((i=1; i<=$DN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_D}${i} -c "create table t(a int, b text);"
++done
++
++for ((i=1; i<=$CN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create table t(a int, b text) partition by range(a);"
++done
++
++
++for ((i=1; i<=$CN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create table t_local partition of t for values from (1) to (1000);"
++	for ((j=1; j<=$DN; j++))
++	do
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create foreign table t_s${j} partition of t for values from ($(( ${j}*1000+1 ))) to ($(( (${j}+1)*1000 ))) server s${j} options(schema_name 'public', table_name 't');"
++	done
++done
++
++
++echo "[`date`] `basename $0` is done !!!"
+diff --git a/tc-2-with-GTM.sh b/tc-2-with-GTM.sh
+new file mode 100755
+index 0000000000..dd32530812
+--- /dev/null
++++ b/tc-2-with-GTM.sh
+@@ -0,0 +1,40 @@
++#!/bin/bash
++
++#set -x
++
++
++### load local environment
++source pgenv_fdw
++
++
++echo "[`date`] `basename` $0 started ..."
++
++if [ "$GTM" == "enable" ]; then
++	$PGBIN/psql -d postgres -p ${PGPORT_G} -c "drop table if exists t_fdw_2pc_xact;"
++	$PGBIN/psql -d postgres -p ${PGPORT_G} -c "create table t_fdw_2pc_xact(id int, xact_id text, resolved text);"
++fi
++
++for ((i=1; i<=$DN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_D}${i} -c "drop table if exists t;"
++	$PGBIN/psql -d postgres -p ${PGPORT_D}${i} -c "create table t(a int, b text);"
++done
++
++for ((i=1; i<=$CN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "drop table if exists t;"
++	$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create table t(a int, b text) partition by range(a);"
++done
++
++
++for ((i=1; i<=$CN; i++))
++do
++	$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create table t_local partition of t for values from (1) to (1000);"
++	for ((j=1; j<=$DN; j++))
++	do
++		$PGBIN/psql -d postgres -p ${PGPORT_C}${i} -c "create foreign table t_s${j} partition of t for values from ($(( ${j}*1000+1 ))) to ($(( (${j}+1)*1000 ))) server s${j} options(schema_name 'public', table_name 't');"
++	done
++done
++
++
++echo "[`date`] `basename $0` is done !!!"
