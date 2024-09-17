@@ -48,10 +48,10 @@ index 0000000000..2a5a8c6e1a
 +
 diff --git a/src/test/modules/highgoStorage/highgostorage.c b/src/test/modules/highgoStorage/highgostorage.c
 new file mode 100644
-index 0000000000..51516fa1d1
+index 0000000000..e38258dc84
 --- /dev/null
 +++ b/src/test/modules/highgoStorage/highgostorage.c
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,714 @@
 +#include "postgres.h"
 +
 +#include <math.h>
@@ -69,6 +69,8 @@ index 0000000000..51516fa1d1
 +#include "utils/builtins.h"
 +#include "utils/rel.h"
 +#include "storage/bufmgr.h"
++#include "utils/lsyscache.h"
++#include "utils/datum.h"
 +
 +PG_MODULE_MAGIC;
 +
@@ -83,15 +85,41 @@ index 0000000000..51516fa1d1
 +typedef HighgoScanDescData *HighgoScanDesc;
 +
 +#define MAXDATA 1000
-+#define MAXCOL 10
-+static Datum mydata[MAXDATA][MAXCOL] = {0};
-+static bool mynull[MAXDATA][MAXCOL] = {0};
-+static int numData = 0;
 +
++/*
++ * fixme: this is an example code and there is no lock defined to
++ * protect the contents of mytuples[]. So be aware and do not use
++ * this access method concurrently
++ */
++static int numData = 0;
++static HeapTuple mytuples[MAXDATA] = {0};
++static bool spacetaken[MAXDATA] = {0};
++
++static int find_free_space(void)
++{
++	int i = 0;
++	for (i = 0; i < MAXDATA; i++)
++	{
++		if (spacetaken[i] == false)
++			return i;
++	}
++	return -1;
++}
++
++static int get_next_tuple_from_index(int index)
++{
++	int i = 0;
++	for (i = index; i < MAXDATA; i++)
++	{
++		if (spacetaken[i] == true)
++			return i;
++	}
++	return -1;
++}
 +static const TupleTableSlotOps *
 +highgo_slot_callbacks(Relation relation)
 +{
-+	return &TTSOpsVirtual;
++	return &TTSOpsHeapTuple;
 +}
 +
 +static TableScanDesc highgo_scan_begin(Relation rel,
@@ -116,7 +144,10 @@ index 0000000000..51516fa1d1
 +static bool
 +highgo_tuple_tid_valid (TableScanDesc scan, ItemPointer tid)
 +{
-+	return true;
++	if (tid->ip_posid < MAXDATA)
++		return true;
++
++	return false;
 +}
 +
 +static void
@@ -141,27 +172,25 @@ index 0000000000..51516fa1d1
 +					   TupleTableSlot *slot)
 +{
 +	HighgoScanDesc tscan = (HighgoScanDesc) scan;
++	int index = -1;
 +
-+	slot->tts_nvalid = 0;
-+	slot->tts_flags |= TTS_FLAG_EMPTY;
-+
-+	if (tscan->tupidx < numData)
-+	{
-+		TupleDesc desc = RelationGetDescr(tscan->scan.rs_rd);
-+		for (AttrNumber attno = 0; attno < desc->natts; attno++)
-+		{
-+			slot->tts_values[attno] = mydata[tscan->tupidx][attno];
-+			slot->tts_isnull[attno] = mynull[tscan->tupidx][attno];
-+		}
-+
-+		ItemPointerSet(&slot->tts_tid, 1, tscan->tupidx);
-+		slot->tts_nvalid = slot->tts_tupleDescriptor->natts;
-+		slot->tts_flags &= ~TTS_FLAG_EMPTY;
-+		tscan->tupidx++;
-+		return true;
-+	}
-+	else
++	/* this means we have exhausted all the data */
++	if (tscan->tupidx > MAXDATA)
 +		return false;
++
++	/* get next valid tuple from array */
++	index = get_next_tuple_from_index(tscan->tupidx);
++
++	/* nothing to get */
++	if (index == -1)
++		return false;
++
++	/* turn this heap tuple into a tuple table slot */
++	ExecStoreHeapTuple(mytuples[index], slot, false);
++
++	/* move 1 position after index down the array */
++	tscan->tupidx = index + 1;
++	return true;
 +}
 +
 +static Size
@@ -232,9 +261,28 @@ index 0000000000..51516fa1d1
 +							  Snapshot snapshot,
 +							  TupleTableSlot *slot)
 +{
-+	ereport(ERROR,
-+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-+			 errmsg("I am working on implementing %s function", __func__)));
++	int index = tid->ip_posid;
++
++	/* Check if the tuple exists in the array */
++	if (index < 0 || index >= MAXDATA || mytuples[index] == NULL ||
++			spacetaken[index] == false)
++	{
++		elog(WARNING, "Tuple not found or already deleted.");
++		return false;
++	}
++
++	/*
++	 * we do not support multi-version of a tuple, so if tuple
++	 * exists in the mytuples array, then it is always visible.
++	 * Normally with heap access method, we would call
++	 * HeapTupleSatisfiesVisibility() and pass the snapshot to
++	 * determine a tuple's visibility before we can execute
++	 * update
++	 */
++	ExecStoreHeapTuple(mytuples[index], slot, false);
++
++	/* Return true indicating that the tuple was successfully fetched */
++	return true;
 +}
 +static void
 +highgo_tuple_get_latest_tid(TableScanDesc scan,
@@ -260,15 +308,42 @@ index 0000000000..51516fa1d1
 +				   CommandId cid, int options,
 +				   struct BulkInsertStateData *bistate)
 +{
-+	int i = 0;
-+	if (numData >= MAXDATA)
-+		elog(ERROR, "data full");
++	int space = -1;
++	bool		shouldFree = true;
++	HeapTuple tup;
++	MemoryContext oldContext;
 +
-+	for (i = 0; i < (rel->rd_att->natts > MAXCOL ? MAXCOL : rel->rd_att->natts); i++)
-+	{
-+		mydata[numData][i] = slot->tts_values[i];
-+		mynull[numData][i] = slot->tts_isnull[i];
-+	}
++	space = find_free_space();
++	if (space == -1)
++		elog(ERROR, "data space full");
++
++	/* turn slot into a heap tuple */
++	tup = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
++
++	/* set ctid to block 0 and pos = current numData */
++	tup->t_self.ip_blkid.bi_hi = 0;
++	tup->t_self.ip_blkid.bi_lo = 0;
++	tup->t_self.ip_posid = space;
++
++	/*
++	 * switch current memory context to TopMemoryContext, so memory allocation
++	 * after this point can persist across different transactions
++	 */
++	oldContext = MemoryContextSwitchTo(TopMemoryContext);
++
++	/* copy tuple data to our own global array */
++	mytuples[space] = heap_copytuple(tup);
++
++	/* mark this position as taken */
++	spacetaken[space] = true;
++
++	elog(WARNING, "store in slot %d", space);
++	/* copy t_self back to slot */
++	ItemPointerCopy(&tup->t_self, &slot->tts_tid);
++
++	/* switch back to old memory context after the copy */
++	MemoryContextSwitchTo(oldContext);
++
 +	numData++;
 +}
 +
@@ -306,18 +381,81 @@ index 0000000000..51516fa1d1
 +				   TM_FailureData *tmfd,
 +				   bool changingPart)
 +{
-+	ereport(ERROR,
-+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-+			 errmsg("I am working on implementing %s function", __func__)));
++	int index = tid->ip_posid;
++	TM_Result	result;
++
++	/* check if there is data to delete */
++	if (spacetaken[index] == true)
++	{
++		/* Free the tuple memory */
++		heap_freetuple(mytuples[index]);
++
++		/* Set the tuple pointer to NULL to avoid dangling pointers */
++		mytuples[index] = NULL;
++
++		/* mark its position as free */
++		spacetaken[index] = false;
++
++		result = TM_Ok;
++
++		numData--;
++	}
++	else
++	{
++		elog(WARNING, "data is already deleted");
++		result = TM_Deleted;
++	}
++	return result;
 +}
 +
 +static void
 +highgo_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 +				   CommandId cid, int options, struct BulkInsertStateData *bistate)
 +{
-+	ereport(ERROR,
-+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-+			 errmsg("I am working on implementing %s function", __func__)));
++	int i = 0, space = -1;
++    bool shouldFree;
++    MemoryContext oldContext;
++    HeapTuple tup;
++
++    elog(WARNING, "multi-insert");
++
++    /* Iterate through each tuple in the slots array */
++    for (i = 0; i < nslots; i++)
++    {
++    	space = find_free_space();
++    	if (space == -1)
++    		elog(ERROR, "data space full");
++
++    	/* turn slot into a heap tuple */
++    	tup = ExecFetchSlotHeapTuple(slots[i], true, &shouldFree);
++
++    	/* set ctid to block 0 and pos = current numData */
++    	tup->t_self.ip_blkid.bi_hi = 0;
++    	tup->t_self.ip_blkid.bi_lo = 0;
++    	tup->t_self.ip_posid = space;
++
++    	/*
++    	 * switch current memory context to TopMemoryContext, so memory allocation
++    	 * after this point can persist across different transactions
++    	 */
++    	oldContext = MemoryContextSwitchTo(TopMemoryContext);
++
++    	/* copy tuple data to our own global array */
++    	mytuples[space] = heap_copytuple(tup);
++
++    	/* mark this position as taken */
++    	spacetaken[space] = true;
++
++    	elog(WARNING, "store in slot %d", space);
++
++    	/* copy t_self back to slot */
++    	ItemPointerCopy(&tup->t_self, &(slots[i]->tts_tid));
++
++    	/* switch back to old memory context after the copy */
++    	MemoryContextSwitchTo(oldContext);
++
++    	numData++;
++    }
 +}
 +
 +static TM_Result
@@ -332,9 +470,41 @@ index 0000000000..51516fa1d1
 +				   LockTupleMode *lockmode,
 +				   bool *update_indexes)
 +{
-+	ereport(ERROR,
-+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-+			 errmsg("I am working on implementing %s function", __func__)));
++	int index = otid->ip_posid;
++	HeapTuple newTuple;
++	TM_Result	result;
++	MemoryContext oldContext;
++	bool shouldFree = true;
++
++	/* check if there is data to update */
++	if (spacetaken[index] == true)
++	{
++		/* Fetch the new tuple from the TupleTableSlot */
++		newTuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
++
++		/* Switch to TopMemoryContext to persist the new tuple */
++		oldContext = MemoryContextSwitchTo(TopMemoryContext);
++
++		/* Free the tuple memory before replacing it */
++		heap_freetuple(mytuples[index]);
++
++		/* Copy the new tuple to persistent memory and store it in the array */
++		mytuples[index] = heap_copytuple(newTuple);
++
++		/* Restore previous memory context */
++		MemoryContextSwitchTo(oldContext);
++
++		/* Mark the tuple as present */
++		spacetaken[index] = true;
++
++		result = TM_Ok;
++	}
++	else
++	{
++		elog(WARNING, "no data to update");
++		result = TM_Deleted;
++	}
++	return result;
 +}
 +
 +static TM_Result
@@ -525,7 +695,7 @@ index 0000000000..51516fa1d1
 +static uint64
 +highgo_relation_size (Relation rel, ForkNumber forkNumber)
 +{
-+	return sizeof(mydata);
++	return sizeof(mytuples);
 +}
 +
 +static bool
