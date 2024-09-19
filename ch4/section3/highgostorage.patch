@@ -48,10 +48,10 @@ index 0000000000..2a5a8c6e1a
 +
 diff --git a/src/test/modules/highgoStorage/highgostorage.c b/src/test/modules/highgoStorage/highgostorage.c
 new file mode 100644
-index 0000000000..e38258dc84
+index 0000000000..974e52e944
 --- /dev/null
 +++ b/src/test/modules/highgoStorage/highgostorage.c
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,716 @@
 +#include "postgres.h"
 +
 +#include <math.h>
@@ -617,6 +617,7 @@ index 0000000000..e38258dc84
 +{
 +	TupleTableSlot *slot;
 +	EState     *estate;
++	int cnt = 0;
 +
 +	estate = CreateExecutorState();
 +	slot = table_slot_create(heap_rel, NULL);
@@ -642,13 +643,14 @@ index 0000000000..e38258dc84
 +		callback(heap_rel, &heapTuple->t_self, values, isnull, true,
 +				 callback_state);
 +		pfree(heapTuple);
++		cnt++;
 +	}
 +
 +	highgo_scan_end(scan);
 +	ExecDropSingleTupleTableSlot(slot);
 +	FreeExecutorState(estate);
 +
-+	return 10;
++	return cnt;
 +}
 +
 +static void
