@@ -48,10 +48,10 @@ index 0000000000..2a5a8c6e1a
 +
 diff --git a/src/test/modules/highgoStorage/highgostorage.c b/src/test/modules/highgoStorage/highgostorage.c
 new file mode 100644
-index 0000000000..974e52e944
+index 0000000000..bd190769a2
 --- /dev/null
 +++ b/src/test/modules/highgoStorage/highgostorage.c
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,719 @@
 +#include "postgres.h"
 +
 +#include <math.h>
@@ -86,11 +86,6 @@ index 0000000000..974e52e944
 +
 +#define MAXDATA 1000
 +
-+/*
-+ * fixme: this is an example code and there is no lock defined to
-+ * protect the contents of mytuples[]. So be aware and do not use
-+ * this access method concurrently
-+ */
 +static int numData = 0;
 +static HeapTuple mytuples[MAXDATA] = {0};
 +static bool spacetaken[MAXDATA] = {0};
@@ -248,11 +243,19 @@ index 0000000000..974e52e944
 +						TupleTableSlot *slot,
 +						bool *call_again, bool *all_dead)
 +{
++	int index = tid->ip_posid;
 +
-+	ereport(ERROR,
-+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-+			 errmsg("I am working on implementing %s function", __func__)));
-+
++	/* check if there is data to fetch */
++	if (spacetaken[index] == true)
++	{
++		/* turn this heap tuple into a tuple table slot */
++		ExecStoreHeapTuple(mytuples[index], slot, false);
++	}
++	else
++	{
++		return false;
++	}
++	return true;
 +}
 +
 +static bool
