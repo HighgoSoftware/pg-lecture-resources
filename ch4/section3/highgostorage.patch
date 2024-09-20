@@ -48,10 +48,10 @@ index 0000000000..2a5a8c6e1a
 +
 diff --git a/src/test/modules/highgoStorage/highgostorage.c b/src/test/modules/highgoStorage/highgostorage.c
 new file mode 100644
-index 0000000000..bd190769a2
+index 0000000000..25c8355d80
 --- /dev/null
 +++ b/src/test/modules/highgoStorage/highgostorage.c
-@@ -0,0 +1,719 @@
+@@ -0,0 +1,751 @@
 +#include "postgres.h"
 +
 +#include <math.h>
@@ -125,6 +125,7 @@ index 0000000000..bd190769a2
 +{
 +	HighgoScanDesc tscan;
 +
++	elog(WARNING, "%s", __func__);
 +	tscan = palloc0(sizeof(HighgoScanDescData));
 +	tscan->scan.rs_rd = rel;
 +	tscan->scan.rs_snapshot = snapshot;
@@ -139,6 +140,8 @@ index 0000000000..bd190769a2
 +static bool
 +highgo_tuple_tid_valid (TableScanDesc scan, ItemPointer tid)
 +{
++	elog(WARNING, "%s", __func__);
++
 +	if (tid->ip_posid < MAXDATA)
 +		return true;
 +
@@ -148,6 +151,7 @@ index 0000000000..bd190769a2
 +static void
 +highgo_scan_end(TableScanDesc scan)
 +{
++	elog(WARNING, "%s", __func__);
 +	pfree(scan);
 +}
 +
@@ -175,6 +179,8 @@ index 0000000000..bd190769a2
 +
 +	/* get next valid tuple from array */
 +	index = get_next_tuple_from_index(tscan->tupidx);
++
++	elog(WARNING, "%s - %d", __func__, index);
 +
 +	/* nothing to get */
 +	if (index == -1)
@@ -218,6 +224,7 @@ index 0000000000..bd190769a2
 +highgo_index_fetch_begin(Relation rel)
 +{
 +	IndexFetchTableData *tfetch = palloc0(sizeof(IndexFetchTableData));
++	elog(WARNING, "%s", __func__);
 +
 +	tfetch->rel = rel;
 +
@@ -227,12 +234,14 @@ index 0000000000..bd190769a2
 +static void
 +highgo_index_fetch_reset(struct IndexFetchTableData *data)
 +{
++	elog(WARNING, "%s", __func__);
 +	return;
 +}
 +
 +static void
 +highgo_index_fetch_end(struct IndexFetchTableData *data)
 +{
++	elog(WARNING, "%s", __func__);
 +	pfree(data);
 +}
 +
@@ -244,6 +253,7 @@ index 0000000000..bd190769a2
 +						bool *call_again, bool *all_dead)
 +{
 +	int index = tid->ip_posid;
++	elog(WARNING, "%s", __func__);
 +
 +	/* check if there is data to fetch */
 +	if (spacetaken[index] == true)
@@ -265,6 +275,11 @@ index 0000000000..bd190769a2
 +							  TupleTableSlot *slot)
 +{
 +	int index = tid->ip_posid;
++	HeapTupleTableSlot *hslot = (HeapTupleTableSlot *) slot;
++
++	elog(WARNING, "%s - %d", __func__, index);
++
++	hslot->base.tts_tid = *tid;
 +
 +	/* Check if the tuple exists in the array */
 +	if (index < 0 || index >= MAXDATA || mytuples[index] == NULL ||
@@ -316,9 +331,12 @@ index 0000000000..bd190769a2
 +	HeapTuple tup;
 +	MemoryContext oldContext;
 +
++
 +	space = find_free_space();
 +	if (space == -1)
 +		elog(ERROR, "data space full");
++
++	elog(WARNING, "%s - %d", __func__, space);
 +
 +	/* turn slot into a heap tuple */
 +	tup = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
@@ -340,7 +358,6 @@ index 0000000000..bd190769a2
 +	/* mark this position as taken */
 +	spacetaken[space] = true;
 +
-+	elog(WARNING, "store in slot %d", space);
 +	/* copy t_self back to slot */
 +	ItemPointerCopy(&tup->t_self, &slot->tts_tid);
 +
@@ -390,6 +407,8 @@ index 0000000000..bd190769a2
 +	/* check if there is data to delete */
 +	if (spacetaken[index] == true)
 +	{
++		elog(WARNING, "%s - %d", __func__, index);
++
 +		/* Free the tuple memory */
 +		heap_freetuple(mytuples[index]);
 +
@@ -420,7 +439,7 @@ index 0000000000..bd190769a2
 +    MemoryContext oldContext;
 +    HeapTuple tup;
 +
-+    elog(WARNING, "multi-insert");
++	elog(WARNING, "%s", __func__);
 +
 +    /* Iterate through each tuple in the slots array */
 +    for (i = 0; i < nslots; i++)
@@ -479,9 +498,11 @@ index 0000000000..bd190769a2
 +	MemoryContext oldContext;
 +	bool shouldFree = true;
 +
-+	/* check if there is data to update */
++	/* check if there is data to update - do inplace update if valid */
 +	if (spacetaken[index] == true)
 +	{
++		elog(WARNING, "%s - %d", __func__, index);
++
 +		/* Fetch the new tuple from the TupleTableSlot */
 +		newTuple = ExecFetchSlotHeapTuple(slot, true, &shouldFree);
 +
@@ -494,12 +515,20 @@ index 0000000000..bd190769a2
 +		/* Copy the new tuple to persistent memory and store it in the array */
 +		mytuples[index] = heap_copytuple(newTuple);
 +
-+		/* Restore previous memory context */
-+		MemoryContextSwitchTo(oldContext);
-+
 +		/* Mark the tuple as present */
 +		spacetaken[index] = true;
 +
++		/* update tid of new tuple */
++		newTuple->t_self.ip_blkid.bi_hi = 0;
++		newTuple->t_self.ip_blkid.bi_lo = 0;
++		newTuple->t_self.ip_posid = index;
++		ItemPointerCopy(&newTuple->t_self, &slot->tts_tid);
++
++		/* in-place update, no need to update index */
++		*update_indexes = false;
++
++		/* Restore previous memory context */
++		MemoryContextSwitchTo(oldContext);
 +		result = TM_Ok;
 +	}
 +	else
@@ -541,6 +570,7 @@ index 0000000000..bd190769a2
 +	 * RelationGetNumberOfBlocks, from index_update_stats(), and that
 +	 * fails if the underlying file doesn't exist.
 +	 */
++	elog(WARNING, "%s", __func__);
 +	RelationCreateStorage(rel->rd_node, persistence, true);
 +}
 +
@@ -622,6 +652,7 @@ index 0000000000..bd190769a2
 +	EState     *estate;
 +	int cnt = 0;
 +
++	elog(WARNING, "%s", __func__);
 +	estate = CreateExecutorState();
 +	slot = table_slot_create(heap_rel, NULL);
 +
@@ -676,6 +707,7 @@ index 0000000000..bd190769a2
 +	*pages = 1;
 +	*tuples = numData;
 +	*allvisfrac = 1.0;
++	elog(WARNING, "%s", __func__);
 +}
 +
 +static bool
